@@ -1,0 +1,43 @@
+# ===== Dependencies =====
+node_modules/
+.pnp
+.pnp.js
+
+# ===== Build outputs =====
+dist/
+app/dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# ===== Environment / secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Local database (user books data) =====
+*.db
+*.sqlite
+*.sqlite3
+app/data/*.db
+
+# ===== Backups / temp / logs =====
+_removed_dist_bak/
+app-backup/
+*.bak*
+*.log
+*.tsbuildinfo
+node_modules/.tmp/
+
+# ===== OS / editor =====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ===== Rust artifacts =====
+*.pdb
+
+# ===== Misc =====
+.cache/

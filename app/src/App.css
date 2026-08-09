@@ -1,0 +1,416 @@
+/* Global Styles */
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;500;600;700;800&display=swap');
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Bricolage Grotesque', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Selection */
+::selection {
+  background: rgba(229, 163, 73, 0.3);
+  color: inherit;
+}
+
+/* Gradient Radial */
+.bg-gradient-radial {
+  background: radial-gradient(circle, var(--tw-gradient-stops));
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(229, 163, 73, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 40px rgba(229, 163, 73, 0.5);
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.5s ease-out forwards;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 3s ease-in-out infinite;
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+/* Card Hover Effects */
+.card-hover {
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.card-hover:hover {
+  transform: translateY(-8px);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+}
+
+/* Button Ripple Effect */
+.btn-ripple {
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-ripple::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  transition: width 0.3s, height 0.3s;
+}
+
+.btn-ripple:active::after {
+  width: 200%;
+  height: 200%;
+}
+
+/* Glass Effect */
+.glass {
+  background: rgba(40, 43, 47, 0.8);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+/* Text Gradient */
+.text-gradient {
+  background: linear-gradient(135deg, #e5a349 0%, #f4c430 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Border Gradient */
+.border-gradient {
+  position: relative;
+}
+
+.border-gradient::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 2px;
+  background: linear-gradient(135deg, #e5a349, #7ca2b5);
+  border-radius: inherit;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  -webkit-mask-composite: xor;
+}
+
+/* Focus Styles */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #e5a349;
+  outline-offset: 2px;
+}
+
+/* Reduced Motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Mobile Optimizations */
+@media (max-width: 768px) {
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Reader Theme Styles */
+.reader-theme-light {
+  background-color: #f5f2e9;
+  color: #2c2c2c;
+}
+
+.reader-theme-dark {
+  background-color: #1a1c1f;
+  color: #e0e0e0;
+}
+
+.reader-theme-sepia {
+  background-color: #f4ecd8;
+  color: #5b4636;
+}
+
+/* Word Highlight Animation */
+@keyframes highlight-pulse {
+  0%, 100% {
+    background-color: rgba(229, 163, 73, 0.2);
+  }
+  50% {
+    background-color: rgba(229, 163, 73, 0.4);
+  }
+}
+
+.word-highlight {
+  animation: highlight-pulse 2s ease-in-out infinite;
+}
+
+/* Progress Bar Animation */
+@keyframes progress-shine {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.progress-animated {
+  background: linear-gradient(
+    90deg,
+    #e5a349 0%,
+    #f4c430 50%,
+    #e5a349 100%
+  );
+  background-size: 200% 100%;
+  animation: progress-shine 2s linear infinite;
+}
+
+/* ========== Reader HTML Content Styles ========== */
+.reader-html-content {
+  /* 基础排版 */
+}
+
+.reader-html-content p {
+  margin-bottom: 1.25em;
+  line-height: inherit;
+  text-align: justify;
+}
+
+.reader-html-content h1,
+.reader-html-content h2,
+.reader-html-content h3,
+.reader-html-content h4,
+.reader-html-content h5,
+.reader-html-content h6 {
+  margin-top: 1.5em;
+  margin-bottom: 0.75em;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.reader-html-content h1 { font-size: 1.8em; }
+.reader-html-content h2 { font-size: 1.5em; }
+.reader-html-content h3 { font-size: 1.3em; }
+.reader-html-content h4 { font-size: 1.15em; }
+
+.reader-html-content img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.5em auto;
+  border-radius: 8px;
+}
+
+.reader-html-content figure {
+  margin: 1.5em 0;
+  text-align: center;
+}
+
+.reader-html-content figcaption {
+  font-size: 0.85em;
+  opacity: 0.7;
+  margin-top: 0.5em;
+}
+
+.reader-html-content blockquote {
+  margin: 1.5em 0;
+  padding-left: 1.5em;
+  border-left: 3px solid currentColor;
+  opacity: 0.85;
+  font-style: italic;
+}
+
+.reader-html-content pre {
+  margin: 1.5em 0;
+  padding: 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.9em;
+  line-height: 1.5;
+  background: rgba(128, 128, 128, 0.1);
+}
+
+.reader-html-content code {
+  font-size: 0.9em;
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.15);
+}
+
+.reader-html-content ul,
+.reader-html-content ol {
+  margin: 1em 0;
+  padding-left: 2em;
+}
+
+.reader-html-content li {
+  margin-bottom: 0.5em;
+}
+
+.reader-html-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5em 0;
+}
+
+.reader-html-content th,
+.reader-html-content td {
+  padding: 0.5em 0.75em;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  text-align: left;
+}
+
+.reader-html-content th {
+  font-weight: 600;
+  background: rgba(128, 128, 128, 0.1);
+}
+
+.reader-html-content hr {
+  margin: 2em 0;
+  border: none;
+  border-top: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+.reader-html-content a {
+  color: #e5a349;
+  text-decoration: underline;
+}
+
+.reader-html-content a:hover {
+  opacity: 0.8;
+}
+
+.reader-html-content sup,
+.reader-html-content sub {
+  font-size: 0.75em;
+}
+
+.reader-html-content center {
+  text-align: center;
+}
+
+.reader-html-content .epub-image,
+.reader-html-content .illustration {
+  max-width: 100%;
+  height: auto;
+  margin: 1.5em auto;
+  display: block;
+}
+
+/* Marked words - inline highlight */
+.reader-html-content mark {
+  background-color: rgba(229, 163, 73, 0.3) !important;
+  border-bottom: 2px solid #e5a349 !important;
+  padding: 0 2px !important;
+  border-radius: 2px !important;
+  cursor: pointer !important;
+  color: inherit !important;
+}
+
+/* Dark theme adjustments for reader content */
+.reader-theme-dark .reader-html-content a {
+  color: #e5a349;
+}
+
+.reader-theme-dark .reader-html-content pre,
+.reader-theme-dark .reader-html-content code {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Sepia theme adjustments */
+.reader-theme-sepia .reader-html-content a {
+  color: #8b6914;
+}
+
+/* Light theme adjustments */
+.reader-theme-light .reader-html-content a {
+  color: #c47a1a;
+}

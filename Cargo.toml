@@ -1,0 +1,6 @@
+[workspace]
+members = ["src-tauri"]
+
+# 防止 workspace 的 dependencies 与 src-tauri 冲突
+[profile.release]
+codegen-units = 1

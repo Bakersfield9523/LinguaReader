@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LinguaReader",
+  "version": "4.4.1",
+  "identifier": "com.linguareader.app",
+  "build": {
+    "frontendDist": "../app/dist/public",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "cd ../app && npm run dev",
+    "beforeBuildCommand": "cd ../app && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LinguaReader",
+        "width": 800,
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* ws://localhost:* https:; font-src 'self' data:; img-src 'self' data: blob: https:; media-src 'self' https: blob:;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../app/dist/boot.js": "boot.js",
+      "../app/dist/package.json": "package.json",
+      "../app/dist/node_modules/better-sqlite3": "node_modules/better-sqlite3",
+      "../app/dist/node_modules/bindings": "node_modules/bindings",
+      "../app/dist/node_modules/file-uri-to-path": "node_modules/file-uri-to-path"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both"
+      }
+    }
+  }
+}
