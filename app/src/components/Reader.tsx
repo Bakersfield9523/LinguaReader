@@ -362,6 +362,9 @@ export function Reader({
   const [chapters, setChapters] = useState<Chapter[]>(book.chapters || []);
   const [currentChapter, setCurrentChapter] = useState(book.currentChapter || 0);
   const [chapterContent, setChapterContent] = useState<string>('');
+  // 当前章节涉及的书籍自带样式表（含内联 <style> 与外部 <link>），作用域化后注入阅读器，
+  // 使角标/引用等靠 class 定义的小字号排版得以还原。
+  const [bookCss, setBookCss] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [parser, setParser] = useState<EPUBParser | PDFParser | null>(null);
   const [contents, setContents] = useState<Map<string, string>>(new Map());
@@ -695,8 +698,9 @@ export function Reader({
     } else if (parser instanceof EPUBParser && chapter.href) {
       // 动态加载 EPUB 章节
       const content = await parser.getChapterContent(chapter.href);
-      setChapterContent(content);
-      contents.set(chapterId, content);
+      setChapterContent(content.html);
+      setBookCss(content.css);
+      contents.set(chapterId, content.html);
       setContents(new Map(contents));
     } else {
       // 没有预加载内容时的 fallback（PDF 或其他格式）
@@ -1295,6 +1299,7 @@ export function Reader({
         onClick={handleContentClick}
         onMouseUp={handleContentMouseUp}
       >
+        {bookCss ? <style>{scopeCss(bookCss, '.reader-html-content')}</style> : null}
         {parseHtmlToReact(chapterContent, markedWords, currentChapterHighlights)}
       </div>
     );
@@ -1616,8 +1621,9 @@ export function Reader({
                               setChapterContent(latestContents.get(chId) || '');
                             } else if (latestParser instanceof EPUBParser && latestFlatChapters[idx]?.href) {
                               const content = await latestParser.getChapterContent(latestFlatChapters[idx].href!);
-                              setChapterContent(content);
-                              latestContents.set(chId!, content);
+                              setChapterContent(content.html);
+                              setBookCss(content.css);
+                              latestContents.set(chId!, content.html);
                               setContents(new Map(latestContents));
                             }
                             const rawProgress = ((idx + 1) / latestFlatChapters.length) * 100;
@@ -2014,6 +2020,73 @@ export function Reader({
 interface ParseOptions {
   markedWords: Set<string>;
   highlights: Highlight[];
+}
+
+/**
+ * 把一段书籍 CSS 的选择器全部前缀为 scope（如 .reader-html-content），
+ * 使其只作用于阅读器内容容器，而不会泄漏到应用其它 UI（侧边栏/对话框等）。
+ * 处理常见结构：普通规则、逗号分组、@media/@supports 嵌套、@font-face/@keyframes/@import 等原样保留。
+ */
+function scopeSelector(sel: string, scope: string): string {
+  let s = sel.replace(/\b(html|body)\b/g, '').replace(/\s{2,}/g, ' ').trim();
+  if (!s) return scope;
+  if (s === '*') return `${scope} *`;
+  return `${scope} ${s}`;
+}
+
+function scopeCss(css: string, scope: string): string {
+  if (!css) return '';
+  const out: string[] = [];
+  let buf = '';
+  let i = 0;
+  const n = css.length;
+  while (i < n) {
+    const ch = css[i];
+    if (/\s/.test(ch)) { buf += ch; i++; continue; }
+    if (ch === '/' && css[i + 1] === '*') {
+      const end = css.indexOf('*/', i + 2);
+      i = end === -1 ? n : end + 2;
+      continue;
+    }
+    if (ch === '{') {
+      const prelude = buf.trim();
+      buf = '';
+      // 找到匹配的右括号（处理嵌套）
+      let depth = 1;
+      let j = i + 1;
+      while (j < n && depth > 0) {
+        if (css[j] === '{') depth++;
+        else if (css[j] === '}') depth--;
+        if (depth === 0) break;
+        j++;
+      }
+      const inner = css.slice(i + 1, j);
+      i = j + 1;
+      if (prelude.startsWith('@')) {
+        if (/^@(media|supports|container|layer)\b/i.test(prelude)) {
+          out.push(`${prelude} {${scopeCss(inner, scope)}}`);
+        } else {
+          out.push(`${prelude} {${inner}}`);
+        }
+      } else {
+        const scoped = prelude.split(',').map(s => scopeSelector(s.trim(), scope)).filter(Boolean).join(', ');
+        out.push(`${scoped} {${inner}}`);
+      }
+      continue;
+    }
+    if (ch === '}') { buf = ''; i++; continue; }
+    if (ch === ';') {
+      const prelude = buf.trim();
+      buf = '';
+      if (prelude) out.push(`${prelude};`);
+      i++; continue;
+    }
+    buf += ch;
+    i++;
+  }
+  const tail = buf.trim();
+  if (tail) out.push(tail);
+  return out.join('\n');
 }
 
 function parseHtmlToReact(

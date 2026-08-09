@@ -243,6 +243,7 @@ function flattenChapters(chapters: Chapter[]): Chapter[] {
 export class EPUBParser {
   private book: any;
   private resources: Map<string, string> = new Map(); // href -> base64
+  private cssResources: Map<string, string> = new Map(); // href -> css text（书籍样式表）
 
   constructor(arrayBuffer: ArrayBuffer) {
     this.book = ePub(arrayBuffer);
@@ -368,7 +369,38 @@ export class EPUBParser {
         }
       }
       
-      console.log(`[EPUB] Successfully extracted ${this.resources.size} resource entries`);
+      // 提取书籍样式表（.css），供章节 <link rel="stylesheet"> 解析后注入阅读器
+      const cssFiles = allFiles.filter(name => /\.css$/i.test(name));
+      for (const path of cssFiles) {
+        try {
+          const zipEntry = archive.zip.files[path];
+          if (!zipEntry) continue;
+          const text = await zipEntry.async('string');
+          if (!text) continue;
+          const store = (p: string) => {
+            if (!p) return;
+            this.cssResources.set(p, text);
+            this.cssResources.set(p.toLowerCase(), text);
+          };
+          store(path);
+          const fileName = path.split('/').pop()!;
+          store(fileName);
+          const opfDir = (this.book?.directory || '').replace(/\\/g, '/').replace(/\/$/, '');
+          const relOpf = opfRelPath(path, opfDir);
+          if (relOpf && relOpf !== path) store(relOpf);
+          try {
+            const decodedPath = decodeURIComponent(path);
+            store(decodedPath);
+            store(decodedPath.split('/').pop()!);
+          } catch {
+            // ignore
+          }
+        } catch (e) {
+          console.warn('[EPUB] Failed to extract css:', path, e);
+        }
+      }
+
+      console.log(`[EPUB] Successfully extracted ${this.resources.size} resource entries, ${this.cssResources.size} css files`);
     } catch (e) {
       console.warn('[EPUB] Failed to extract resources:', e);
     }
@@ -536,12 +568,13 @@ export class EPUBParser {
   }
 
   // 获取章节 HTML 内容（直接渲染，保留图片和格式）
-  async getChapterContent(href: string): Promise<string> {
+  // 返回 { html: 清洗后的章节 HTML, css: 该章节涉及的书籍样式表（含内联与外部 link） }
+  async getChapterContent(href: string): Promise<{ html: string; css: string }> {
     try {
       return await this.loadRawContent(href);
     } catch (e) {
       console.error('Error loading chapter:', e);
-      return '';
+      return { html: '', css: '' };
     }
   }
 
@@ -559,7 +592,7 @@ export class EPUBParser {
         } catch (e) {
           // ignore
         }
-        return '';
+        return { html: '', css: '' };
       }
 
       await item.load(this.book.load.bind(this.book));
@@ -578,13 +611,13 @@ export class EPUBParser {
         } catch {
           // ignore
         }
-        return '';
+        return { html: '', css: '' };
       }
 
       return this.processHTML(html, href);
     } catch (e) {
       console.warn('Error loading raw content:', href, e);
-      return '';
+      return { html: '', css: '' };
     }
   }
 
@@ -592,14 +625,33 @@ export class EPUBParser {
    * 处理 HTML：清理危险标签，替换图片 src 为 base64
    * 保留所有原始格式、样式、布局
    */
-  private processHTML(html: string, baseHref?: string): string {
-    if (!html) return '';
+  private processHTML(html: string, baseHref?: string): { html: string; css: string } {
+    if (!html) return { html: '', css: '' };
 
     const temp = document.createElement('div');
     temp.innerHTML = html;
 
-    // 移除危险标签
-    temp.querySelectorAll('script, style, nav, link[rel="stylesheet"], iframe, object, embed, base').forEach(el => el.remove());
+    // 收集书籍自带 CSS（内联 <style> 与外部 <link rel="stylesheet">），
+    // 稍后作用域化注入阅读器。若不收集，角标/引用等靠 class 定义的小字号排版会丢失。
+    let bookCss = '';
+    temp.querySelectorAll('style').forEach(el => {
+      bookCss += '\n' + (el.textContent || '');
+      el.remove();
+    });
+    temp.querySelectorAll('link').forEach(el => {
+      const rel = (el.getAttribute('rel') || '').toLowerCase();
+      const href = el.getAttribute('href') || '';
+      const isSheet = rel.includes('stylesheet') || /\.css(\?|$)/i.test(href);
+      if (isSheet) {
+        const cssText = this.getCssResource(href, baseHref);
+        if (cssText) bookCss += '\n' + cssText;
+        el.remove();
+      }
+    });
+    if (bookCss) bookCss = this.replaceResourceUrls(bookCss, baseHref);
+
+    // 移除危险标签（style/link 已上方收集并处理）
+    temp.querySelectorAll('script, nav, iframe, object, embed, base').forEach(el => el.remove());
 
     // XSS 防护：移除所有 on* 事件处理器属性
     temp.querySelectorAll('*').forEach(el => {
@@ -678,7 +730,39 @@ export class EPUBParser {
       }
     });
 
-    return temp.innerHTML;
+    return { html: temp.innerHTML, css: bookCss };
+  }
+
+  /**
+   * 根据 <link href> 解析并返回书籍样式表文本（从 cssResources 中查找）
+   */
+  private getCssResource(href: string, baseHref?: string): string | null {
+    if (!href) return null;
+    if (href.startsWith('data:') || href.startsWith('http') || href.startsWith('blob:')) return null;
+
+    const candidates: string[] = [];
+    const add = (s: string) => {
+      if (!s) return;
+      candidates.push(s);
+      try { candidates.push(decodeURIComponent(s)); } catch { /* ignore */ }
+      const lower = s.toLowerCase();
+      candidates.push(lower);
+      try { candidates.push(decodeURIComponent(lower)); } catch { /* ignore */ }
+    };
+    add(href);
+    const stripped = href.replace(/^(\.\.\/)+/, '');
+    if (stripped !== href) add(stripped);
+    const file = href.split('/').pop() || '';
+    if (file) add(file);
+    if (baseHref) {
+      const resolved = resolveBookPath(baseHref, href);
+      if (resolved) add(resolved);
+    }
+
+    for (const c of candidates) {
+      if (this.cssResources.has(c)) return this.cssResources.get(c)!;
+    }
+    return null;
   }
 
   /**
@@ -760,9 +844,9 @@ export class EPUBParser {
   private rawCache: Map<string, string> = new Map();
 
   async getChapterContentWithCache(href: string): Promise<string> {
-    const html = await this.getChapterContent(href);
-    this.rawCache.set(href, html);
-    return html;
+    const res = await this.getChapterContent(href);
+    this.rawCache.set(href, res.html);
+    return res.html;
   }
 
   async getAllContent(): Promise<{ chapters: Chapter[]; contents: Map<string, string> }> {
@@ -777,7 +861,7 @@ export class EPUBParser {
       if (chapter.href) {
         try {
           const content = await this.getChapterContent(chapter.href);
-          contents.set(chapter.id, content);
+          contents.set(chapter.id, content.html);
         } catch (e) {
           console.warn(`Failed to load chapter ${chapter.id}:`, e);
           contents.set(chapter.id, '');
@@ -1261,7 +1345,7 @@ export async function getBookContent(
         if (chapter.href) {
           try {
             const content = await parser.getChapterContent(chapter.href);
-            contents.set(chapter.id, content);
+            contents.set(chapter.id, content.html);
           } catch (e) {
             contents.set(chapter.id, '');
           }

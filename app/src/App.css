@@ -371,6 +371,11 @@ textarea:focus-visible {
 .reader-html-content sup,
 .reader-html-content sub {
   font-size: 0.75em;
+  vertical-align: super;
+}
+
+.reader-html-content sub {
+  vertical-align: sub;
 }
 
 .reader-html-content center {
