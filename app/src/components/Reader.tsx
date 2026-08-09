@@ -700,6 +700,11 @@ export function Reader({
       const content = await parser.getChapterContent(chapter.href);
       setChapterContent(content.html);
       setBookCss(content.css);
+      if (content.css) {
+        console.log(`[Reader] book css length=${content.css.length}, first 200 chars:`, content.css.slice(0, 200));
+      } else {
+        console.log('[Reader] no book css for chapter', chapter.href);
+      }
       contents.set(chapterId, content.html);
       setContents(new Map(contents));
     } else {
@@ -1623,6 +1628,11 @@ export function Reader({
                               const content = await latestParser.getChapterContent(latestFlatChapters[idx].href!);
                               setChapterContent(content.html);
                               setBookCss(content.css);
+                              if (content.css) {
+                                console.log(`[Reader] book css length=${content.css.length}, first 200 chars:`, content.css.slice(0, 200));
+                              } else {
+                                console.log('[Reader] no book css for chapter', latestFlatChapters[idx].href);
+                              }
                               latestContents.set(chId!, content.html);
                               setContents(new Map(latestContents));
                             }
@@ -2029,6 +2039,10 @@ interface ParseOptions {
  */
 function scopeSelector(sel: string, scope: string): string {
   let s = sel.replace(/\b(html|body)\b/g, '').replace(/\s{2,}/g, ' ').trim();
+  // 去掉移除 html/body 后留下的前导组合符（如 "html > body a" → "> a"）
+  while (/^[>+~\s]/.test(s)) {
+    s = s.replace(/^[>+~\s]+/, '').replace(/\s{2,}/g, ' ').trim();
+  }
   if (!s) return scope;
   if (s === '*') return `${scope} *`;
   return `${scope} ${s}`;
@@ -2069,7 +2083,10 @@ function scopeCss(css: string, scope: string): string {
           out.push(`${prelude} {${inner}}`);
         }
       } else {
-        const scoped = prelude.split(',').map(s => scopeSelector(s.trim(), scope)).filter(Boolean).join(', ');
+        const scoped = splitSelectors(prelude)
+          .map(s => scopeSelector(s.trim(), scope))
+          .filter(Boolean)
+          .join(', ');
         out.push(`${scoped} {${inner}}`);
       }
       continue;
@@ -2087,6 +2104,24 @@ function scopeCss(css: string, scope: string): string {
   const tail = buf.trim();
   if (tail) out.push(tail);
   return out.join('\n');
+}
+
+function splitSelectors(prelude: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of prelude) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current);
+  return parts;
 }
 
 function parseHtmlToReact(

@@ -378,6 +378,21 @@ textarea:focus-visible {
   vertical-align: sub;
 }
 
+/* 兜底：常见 EPUB 脚注/尾注/参考文献角标，即使书籍 CSS 作用域失败也保持小字号上标 */
+.reader-html-content a[href^="#"],
+.reader-html-content .noteref,
+.reader-html-content .footnote,
+.reader-html-content .endnote,
+.reader-html-content .note-ref,
+.reader-html-content .reference,
+.reader-html-content .ref,
+.reader-html-content .fn,
+.reader-html-content .en {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+}
+
 .reader-html-content center {
   text-align: center;
 }

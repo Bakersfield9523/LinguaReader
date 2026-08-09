@@ -280,10 +280,9 @@ export class EPUBParser {
       
       if (imageFiles.length === 0) {
         console.log('[EPUB] No images found in archive');
-        return;
+      } else {
+        console.log(`[EPUB] Found ${imageFiles.length} images in archive`);
       }
-
-      console.log(`[EPUB] Found ${imageFiles.length} images in archive`);
 
       const mimeTypeMap: Record<string, string> = {
         jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
