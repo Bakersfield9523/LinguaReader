@@ -761,17 +761,6 @@ export class EPUBParser {
     for (const c of candidates) {
       if (this.cssResources.has(c)) return this.cssResources.get(c)!;
     }
-
-    // basename 兜底：只要 zip 内某 css 文件名与 link 的 basename 相同即匹配
-    // （忽略路径前缀与大小写）。很多 EPUB 的 <link href> 是相对路径，而 cssResources
-    // 的 key 是 zip 内绝对路径，路径解析稍有不慎就会匹配失败、导致整本书籍 CSS 丢失。
-    // 用文件名兜底可覆盖"路径解析不一致"的绝大多数情况，确保原书排版（角标/引用/首字下沉等）被保留。
-    const linkBase = (href.split('/').pop() || '').toLowerCase();
-    if (linkBase) {
-      for (const [k, v] of this.cssResources) {
-        if (k.toLowerCase().split('/').pop() === linkBase) return v;
-      }
-    }
     return null;
   }
 
@@ -1325,9 +1314,8 @@ async function parsePDF(
 // ============ 获取书籍内容（阅读器用） ============
 export async function getBookContent(
   book: Book
-): Promise<{ parser: EPUBParser | PDFParser | null; chapters: Chapter[]; contents: Map<string, string>; cssContents: Map<string, string> }> {
+): Promise<{ parser: EPUBParser | PDFParser | null; chapters: Chapter[]; contents: Map<string, string> }> {
   const contents = new Map<string, string>();
-  const cssContents = new Map<string, string>();
   
   try {
     const arrayBuffer = base64ToArrayBuffer(book.fileData);
@@ -1338,7 +1326,7 @@ export async function getBookContent(
         parser = new EPUBParser(arrayBuffer);
         await parser.init();
       } catch (e) {
-        return { parser: null, chapters: book.chapters || [], contents, cssContents };
+        return { parser: null, chapters: book.chapters || [], contents };
       }
       
       // 提取图片资源
@@ -1357,8 +1345,6 @@ export async function getBookContent(
           try {
             const content = await parser.getChapterContent(chapter.href);
             contents.set(chapter.id, content.html);
-            // 同步保存书籍 CSS，供初始章节渲染时注入（之前只存 html 导致初始章节完全没书籍样式）
-            if (content.css) cssContents.set(chapter.id, content.css);
           } catch (e) {
             contents.set(chapter.id, '');
           }
@@ -1376,14 +1362,14 @@ export async function getBookContent(
         }
       }
       
-      return { parser, chapters, contents, cssContents };
+      return { parser, chapters, contents };
       
     } else if (book.format === 'pdf') {
       let parser = new PDFParser();
       try {
         await parser.init(arrayBuffer);
       } catch (e) {
-        return { parser: null, chapters: book.chapters || [], contents, cssContents };
+        return { parser: null, chapters: book.chapters || [], contents };
       }
       
       // Use existing chapters or regenerate from outline
@@ -1399,14 +1385,14 @@ export async function getBookContent(
       }
       
       // PDF content is rendered on-demand by PDFCanvasViewer — no need to preload
-      return { parser, chapters, contents, cssContents };
+      return { parser, chapters, contents };
       
     } else if (book.format === 'txt') {
       let text: string;
       try {
         text = base64ToText(book.fileData);
       } catch (e) {
-        return { parser: null, chapters: book.chapters || [], contents, cssContents };
+        return { parser: null, chapters: book.chapters || [], contents };
       }
       
       const chapters = book.chapters || [];
@@ -1425,11 +1411,11 @@ export async function getBookContent(
         contents.set('chapter-1', text);
       }
       
-      return { parser: null, chapters, contents, cssContents };
+      return { parser: null, chapters, contents };
     }
   } catch (e) {
     console.error('Error getting book content:', e);
   }
   
-  return { parser: null, chapters: book.chapters || [], contents, cssContents };
+  return { parser: null, chapters: book.chapters || [], contents };
 }
