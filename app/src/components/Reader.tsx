@@ -1369,9 +1369,10 @@ export function Reader({
     const filePart = hashIdx >= 0 ? href.slice(0, hashIdx).trim() : href.trim();
     let text: string | null = null;
     if (!filePart) {
-      // 同文档锚点：直接在 iframe 文档内按 id 定位
-      const el = doc.getElementById(fragment);
+      // 同文档锚点：用 resolveFootnoteElement 定位，因为精确 id 有时命中纯编号的 <a>，需向上找正文容器
+      const el = resolveFootnoteElement(doc, fragment);
       if (el) text = extractFootnoteText(el);
+      console.log('[footnote] same-doc', fragment, el, text);
     } else {
       // 跨文件：读取目标 xhtml 原文并按 id 定位脚注（EPUB 多把全书脚注集中放 notes.xhtml）
       const parser = parserRef.current as any;
@@ -1381,8 +1382,9 @@ export function Reader({
         if (raw) {
           try {
             const parsed = new DOMParser().parseFromString(raw, 'text/html');
-            const el = parsed.getElementById(fragment);
+            const el = resolveFootnoteElement(parsed, fragment);
             if (el) text = extractFootnoteText(el);
+            console.log('[footnote] cross-file', fragment, el, text);
           } catch (_) { /* ignore */ }
         }
       }
@@ -2608,6 +2610,37 @@ function extractFootnoteText(el: Element): string {
   const clone = el.cloneNode(true) as Element;
   clone.querySelectorAll('a').forEach(a => a.remove());
   return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+}
+// 按 id 找脚注元素：若精确命中元素文本很短（只有编号），则向上查找块容器（li/p/div/aside/section），
+// 因为 EPUB 常见结构是 <li id="note4"><a>4</a> 正文……</li>，精确 id 可能只是 <a> 标记本身。
+function resolveFootnoteElement(doc: Document, fragment: string): Element | null {
+  let el = doc.getElementById(fragment);
+  if (!el) {
+    const variants = [
+      fragment.replace(/^note/i, 'ftn'),
+      fragment.replace(/^ftn/i, 'note'),
+      fragment.replace(/^fn/i, 'note'),
+      fragment + '-note',
+      fragment.replace(/-rtn$/, ''),
+      fragment.replace(/_rtn$/, ''),
+    ];
+    for (const v of variants) { if (v !== fragment) { el = doc.getElementById(v); if (el) break; } }
+  }
+  if (!el) return null;
+  const baseText = extractFootnoteText(el);
+  // 若精确元素文本很短（像纯编号），向上找包含更多正文的块级容器，但止步于 body
+  if (baseText.length <= 5) {
+    let p: Element | null = el;
+    while (p && p !== doc.body) {
+      p = p.parentElement;
+      if (!p || p === doc.body) break;
+      const t = extractFootnoteText(p);
+      if (t.length > baseText.length + 5) {
+        return p;
+      }
+    }
+  }
+  return el;
 }
 function iframeMarkFootnoteRefs(doc: Document) {
   const as = doc.querySelectorAll('a');
