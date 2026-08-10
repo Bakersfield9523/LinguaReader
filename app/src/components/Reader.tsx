@@ -368,7 +368,12 @@ export function Reader({
   const [loading, setLoading] = useState(true);
   const [parser, setParser] = useState<EPUBParser | PDFParser | null>(null);
   const [contents, setContents] = useState<Map<string, string>>(new Map());
-  
+  // 各章节的书籍自带样式表（id -> css），供初始章节/切换章节注入，避免"打开书第一个章节完全没有书籍样式"
+  const [cssContents, setCssContents] = useState<Map<string, string>>(new Map());
+  // EPUB 渲染模式：'iframe' 用 iframe + 原书完整 CSS 原样渲染（最大化保留原书格式，参考 koodo-reader）；
+  // 'react' 用原 React 重建 DOM 渲染（兜底/兼容）。默认 iframe。
+  const [epubRenderMode, setEpubRenderMode] = useState<'iframe' | 'react'>('iframe');
+
   // 单词选择状态
   const [selectedWord, setSelectedWord] = useState<string | null>(null);
   const selectedSentenceRef = useRef<string>('');
@@ -505,8 +510,11 @@ export function Reader({
 
   const contentRef = useRef<HTMLDivElement>(null);
   const htmlContentRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null); // EPUB iframe 渲染容器
   const justSelectedRef = useRef(false); // 阻止 onClick 覆盖 onMouseUp 的 selection 状态
   const pendingScrollHighlightRef = useRef<string | null>(null); // 待滚动到的高亮 ID（从侧边栏点击笔记时设置）
+  const highlightsRef = useRef<Highlight[]>([]); // iframe 桥接用：始终持有最新高亮列表
+  highlightsRef.current = highlights;
 
   // 获取已标记的单词集合（useMemo 避免每次渲染重建 Set）
   const markedWords = useMemo(
@@ -527,14 +535,22 @@ export function Reader({
   // DOM mutation effect 整段删除（之前 ~120 行 + 各种边界 case 全部不再需要）。
   useEffect(() => {
     // 保留滚动到高亮的副作用
-    if (pendingScrollHighlightRef.current && htmlContentRef.current) {
-      const targetEl = htmlContentRef.current.querySelector(`[data-highlight-id="${pendingScrollHighlightRef.current}"]`);
+    const hlId = pendingScrollHighlightRef.current;
+    if (!hlId) return;
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      // iframe 模式下高亮在 iframe 内，postMessage 让 iframe 滚动到该高亮
+      pushToIframe({ type: 'scrollToHighlight', id: hlId });
+      pendingScrollHighlightRef.current = null;
+      return;
+    }
+    if (htmlContentRef.current) {
+      const targetEl = htmlContentRef.current.querySelector(`[data-highlight-id="${hlId}"]`);
       if (targetEl) {
         targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
       pendingScrollHighlightRef.current = null;
     }
-  }, [chapterContent, currentChapter]);
+  }, [chapterContent, currentChapter, epubRenderMode, book.format, pushToIframe]);
 
   // 切换章节展开状态
   const toggleExpand = useCallback((chapterId: string) => {
@@ -580,7 +596,7 @@ export function Reader({
         // 打开书时立即更新 lastReadAt，确保书架排序正确
         onUpdateProgress(book.id, book.progress || 0, book.currentChapter);
 
-        const { parser, chapters: loadedChapters, contents: loadedContents } = await getBookContent(book);
+        const { parser, chapters: loadedChapters, contents: loadedContents, cssContents: loadedCss } = await getBookContent(book);
         
         if (!isMounted) return;
         
@@ -600,6 +616,7 @@ export function Reader({
         setParser(parser);
         setChapters(loadedChapters);
         setContents(loadedContents);
+        setCssContents(loadedCss);
 
         // 使用 book.currentChapter prop（最新值），而不是 stale 的 state
         const initialChapter = Math.min(
@@ -612,10 +629,14 @@ export function Reader({
         const currentChapterId = flat[initialChapter]?.id;
         if (currentChapterId && loadedContents.has(currentChapterId)) {
           setChapterContent(loadedContents.get(currentChapterId) || '');
+          // 关键修复：初始章节也要同步注入该章节的书籍 CSS，
+          // 否则打开书看到的第一个章节完全没有书籍样式（角标/引用/首字下沉等排版全部丢失）。
+          setBookCss(loadedCss.get(currentChapterId) || '');
         } else if (flat.length > 0) {
           // 如果当前章节不存在，加载第一章
           const firstChapterId = flat[0].id;
           setChapterContent(loadedContents.get(firstChapterId) || '');
+          setBookCss(loadedCss.get(firstChapterId) || '');
           setCurrentChapter(0);
         }
       } catch (error) {
@@ -726,11 +747,84 @@ export function Reader({
 
     // 滚动到顶部
     contentRef.current?.scrollTo(0, 0);
-  }, [flatChapters, contents, parser, book.id, onUpdateProgress, loadBookmarks, loadHighlights]);
+    // iframe 模式下新章节 srcDoc 重新加载，自动回到顶部
+    if (epubRenderMode === 'iframe') scrollPosRef.current = 0;
+  }, [flatChapters, contents, parser, book.id, onUpdateProgress, loadBookmarks, loadHighlights, epubRenderMode]);
+
+  // ============ EPUB iframe 渲染：与 iframe 内脚本通信 ============
+  // iframe 内脚本在加载完成后 postMessage {type:'ready'}，父窗口据此注入设置/标记/高亮并恢复滚动位置；
+  // iframe 内的查词/划词/高亮点击也通过 postMessage 回传，复用现有 React 处理逻辑。
+  const pushToIframe = useCallback((msg: any) => {
+    const f = iframeRef.current;
+    if (f && f.contentWindow) {
+      try { f.contentWindow.postMessage({ source: 'lingua-reader-parent', ...msg }, '*'); } catch { /* ignore */ }
+    }
+  }, []);
+
+  // 监听 iframe 消息
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      const d = e.data;
+      if (!d || d.source !== 'lingua-reader-iframe') return;
+      if (d.type === 'ready') {
+        // iframe 刚加载完：下发当前设置/标记/高亮，并恢复滚动位置
+        pushToIframe({ type: 'applySettings', fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme });
+        pushToIframe({ type: 'applyMarks', words: Array.from(markedWords) });
+        pushToIframe({ type: 'applyHighlights', highlights: currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })) });
+        const y = scrollPosRef.current || 0;
+        setTimeout(() => {
+          const f = iframeRef.current;
+          if (f && f.contentWindow) { try { f.contentWindow.scrollTo(0, y); } catch { /* ignore */ } }
+        }, 0);
+      } else if (d.type === 'word') {
+        handleWordClick(d.word, d.sentence);
+      } else if (d.type === 'selection') {
+        setSelectedText(d.text);
+        setSidebarMode('selection');
+        setShowSidebar(true);
+      } else if (d.type === 'highlightClick') {
+        const hl = highlightsRef.current.find(h => h.id === d.id);
+        if (hl) {
+          setActiveHighlight(hl);
+          setNoteDraft(hl.note || '');
+          setSidebarMode('highlightNote');
+          setShowSidebar(true);
+        }
+      }
+    }
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [settings.fontSize, settings.lineHeight, settings.theme, markedWords, currentChapterHighlights, handleWordClick, pushToIframe]);
+
+  // 设置/标记/高亮变化时实时推送给已加载的 iframe（不重建 srcDoc，避免丢失滚动位置）
+  useEffect(() => {
+    pushToIframe({ type: 'applySettings', fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme });
+  }, [settings.fontSize, settings.lineHeight, settings.theme, pushToIframe]);
+
+  useEffect(() => {
+    pushToIframe({ type: 'applyMarks', words: Array.from(markedWords) });
+  }, [markedWords, pushToIframe]);
+
+  useEffect(() => {
+    pushToIframe({ type: 'applyHighlights', highlights: currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })) });
+  }, [currentChapterHighlights, pushToIframe]);
 
   // 滚动位置保存（防抖，500ms）
   // PDF 模式下不处理滚动（PDF 用翻页而非滚动）
   const handleScroll = useCallback(() => {
+    // iframe 渲染模式：滚动发生在 iframe 内部
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      const f = iframeRef.current;
+      if (!f || !f.contentWindow) return;
+      const el = f.contentWindow.document.scrollingElement || f.contentWindow.document.body;
+      const scrollPercent = el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
+      scrollPosRef.current = Math.round(scrollPercent * 100);
+      if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = setTimeout(() => {
+        onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
+      }, 500);
+      return;
+    }
     if (!contentRef.current || book.format === 'pdf') return;
     // 如果正在恢复滚动位置，跳过保存
     if (scrollRestoredRef.current) return;
@@ -741,7 +835,7 @@ export function Reader({
     scrollSaveTimerRef.current = setTimeout(() => {
       onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
     }, 500);
-  }, [book.id, book.format, onUpdateProgress]);
+  }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
 
   // 恢复滚动位置（只在 EPUB/TXT 模式下，且只执行一次）
@@ -1310,6 +1404,37 @@ export function Reader({
     );
   };
 
+  // EPUB iframe 模式：把整章（图片已内联 base64 + 书籍完整 CSS 原样）塞进隔离 iframe，
+  // 原书排版 100% 保留；查词/高亮经 iframe 内脚本 postMessage 桥接回 React。
+  // 注意：srcDoc 只依赖章节内容/书籍 CSS，不依赖设置——设置变化走 postMessage 动态更新，
+  // 避免重建 iframe 导致滚动位置丢失。
+  const epubSrcDoc = useMemo(() => {
+    if (book.format !== 'epub' || epubRenderMode !== 'iframe' || !chapterContent) return '';
+    return buildSrcDoc(chapterContent, bookCss, {
+      fontSize: settings.fontSize,
+      lineHeight: settings.lineHeight,
+      theme: settings.theme,
+    });
+  }, [book.format, epubRenderMode, chapterContent, bookCss]);
+
+  const renderIframeContent = () => {
+    if (!chapterContent) {
+      return (
+        <div className="text-center py-20">
+          <p className="opacity-60">本章内容为空</p>
+        </div>
+      );
+    }
+    return (
+      <iframe
+        ref={iframeRef}
+        srcDoc={epubSrcDoc}
+        title="book-content"
+        className="w-full h-full border-0 bg-transparent"
+      />
+    );
+  };
+
   // 主题样式
   const themeStyles = {
     light: 'bg-[#f5f2e9] text-[#2c2c2c]',
@@ -1686,32 +1811,18 @@ export function Reader({
           ref={contentRef}
           onScroll={book.format === 'pdf' ? undefined : handleScroll}
           className={`flex-1 h-[calc(100vh-64px)] ${
-            book.format === 'pdf' ? 'overflow-hidden' : 'overflow-y-auto'
+            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe'))
+              ? 'overflow-hidden'
+              : 'overflow-y-auto'
           } ${showSidebar && book.format !== 'pdf' ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
         >
-          <div
-            className={book.format === 'pdf' ? '' : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
-            style={book.format === 'pdf' ? undefined : {
-              fontSize: settings.fontSize,
-              lineHeight: settings.lineHeight,
-              fontFamily: settings.fontFamily
-            }}
-          >
-            {/* Chapter Title (EPUB/TXT only) */}
-            {book.format !== 'pdf' && flatChapters[currentChapter] && (
-              <h1 className="text-3xl font-bold mb-8 text-center">
-                {flatChapters[currentChapter].title}
-              </h1>
-            )}
-            
-            {/* Content */}
-            <div className="prose prose-lg max-w-none">
-              {renderContent()}
-            </div>
-
-            {/* Chapter Navigation Footer (EPUB/TXT only) */}
-            {book.format !== 'pdf' && (
-              <div className="flex items-center justify-between mt-16 pt-8 border-t border-current/10">
+          {book.format === 'epub' && epubRenderMode === 'iframe' ? (
+            <div className="flex flex-col h-full">
+              <div className="flex-1 min-h-0">
+                {renderIframeContent()}
+              </div>
+              {/* Chapter Navigation Footer */}
+              <div className="flex items-center justify-between px-6 py-4 border-t border-current/10">
                 <Button
                   variant="ghost"
                   onClick={() => changeChapter(currentChapter - 1)}
@@ -1721,11 +1832,9 @@ export function Reader({
                   <ChevronLeft className="w-4 h-4" />
                   上一章
                 </Button>
-                
                 <span className="text-sm text-white/60">
                   {currentChapter + 1} / {flatChapters.length}
                 </span>
-
                 <Button
                   variant="ghost"
                   onClick={() => changeChapter(currentChapter + 1)}
@@ -1736,8 +1845,58 @@ export function Reader({
                   <ChevronRight className="w-4 h-4" />
                 </Button>
               </div>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div
+              className={book.format === 'pdf' ? '' : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
+              style={book.format === 'pdf' ? undefined : {
+                fontSize: settings.fontSize,
+                lineHeight: settings.lineHeight,
+                fontFamily: settings.fontFamily
+              }}
+            >
+              {/* Chapter Title (EPUB/TXT only) */}
+              {book.format !== 'pdf' && flatChapters[currentChapter] && (
+                <h1 className="text-3xl font-bold mb-8 text-center">
+                  {flatChapters[currentChapter].title}
+                </h1>
+              )}
+
+              {/* Content */}
+              <div className="prose prose-lg max-w-none">
+                {renderContent()}
+              </div>
+
+              {/* Chapter Navigation Footer (EPUB/TXT only) */}
+              {book.format !== 'pdf' && (
+                <div className="flex items-center justify-between mt-16 pt-8 border-t border-current/10">
+                  <Button
+                    variant="ghost"
+                    onClick={() => changeChapter(currentChapter - 1)}
+                    disabled={currentChapter === 0}
+                    className="flex items-center gap-2 bg-current/5 border border-current/15 opacity-90 hover:bg-current/10 hover:opacity-100 disabled:opacity-30"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    上一章
+                  </Button>
+                  
+                  <span className="text-sm text-white/60">
+                    {currentChapter + 1} / {flatChapters.length}
+                  </span>
+
+                  <Button
+                    variant="ghost"
+                    onClick={() => changeChapter(currentChapter + 1)}
+                    disabled={currentChapter >= flatChapters.length - 1}
+                    className="flex items-center gap-2 bg-current/5 border border-current/15 opacity-90 hover:bg-current/10 hover:opacity-100 disabled:opacity-30"
+                  >
+                    下一章
+                    <ChevronRight className="w-4 h-4" />
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
         </main>
 
         {/* Sidebar */}
@@ -2122,6 +2281,249 @@ function splitSelectors(prelude: string): string[] {
   }
   if (current.trim()) parts.push(current);
   return parts;
+}
+
+// ============ EPUB iframe 渲染（参考 koodo-reader：iframe + 原书完整 CSS 原样渲染，最大化保留原书格式） ============
+// 关键思路：把整章（图片已内联 base64、书籍全部 CSS 原样）塞进一个隔离的 iframe，
+// 不再经过 scopeCss 字符串重写、也不经 React 重建 DOM——因此角标/引用/首字下沉/表格/图文混排等
+// 原书排版 100% 保留。查词/划词/高亮经 iframe 内脚本 + postMessage 桥接回 React。
+
+// 阅读器基础排版（注入 iframe head，作用在隔离文档内，无需 scope 前缀）
+const READER_BASE_CSS = `
+* { box-sizing: border-box; }
+html { font-size: 18px; }
+body { margin: 0; padding: 0; }
+.reader-html-content {
+  font-size: var(--reader-font, 18px);
+  line-height: var(--reader-line, 1.6);
+  padding: 2rem 2.2rem 4rem;
+  max-width: 44rem;
+  margin: 0 auto;
+  font-family: 'Bricolage Grotesque', Georgia, 'Times New Roman', serif;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.reader-theme-light { background: #f5f2e9; color: #2c2c2c; }
+.reader-theme-dark { background: #1a1c1f; color: #e0e0e0; }
+.reader-theme-sepia { background: #f4ecd8; color: #5b4636; }
+.reader-html-content p { margin: 0 0 1.25em; text-align: justify; }
+.reader-html-content h1, .reader-html-content h2, .reader-html-content h3,
+.reader-html-content h4, .reader-html-content h5, .reader-html-content h6 {
+  margin: 1.5em 0 0.75em; font-weight: 700; line-height: 1.3;
+}
+.reader-html-content h1 { font-size: 1.8em; }
+.reader-html-content h2 { font-size: 1.5em; }
+.reader-html-content h3 { font-size: 1.3em; }
+.reader-html-content h4 { font-size: 1.15em; }
+.reader-html-content img { max-width: 100%; height: auto; display: block; margin: 1.5em auto; border-radius: 8px; }
+.reader-html-content figure { margin: 1.5em 0; text-align: center; }
+.reader-html-content figcaption { font-size: 0.85em; opacity: 0.7; margin-top: 0.5em; }
+.reader-html-content blockquote { margin: 1.5em 0; padding-left: 1.5em; border-left: 3px solid currentColor; opacity: 0.85; font-style: italic; }
+.reader-html-content pre { margin: 1.5em 0; padding: 1em; border-radius: 8px; overflow-x: auto; font-size: 0.9em; line-height: 1.5; background: rgba(128,128,128,0.1); }
+.reader-html-content code { font-size: 0.9em; padding: 0.1em 0.3em; border-radius: 3px; background: rgba(128,128,128,0.15); }
+.reader-html-content ul, .reader-html-content ol { margin: 1em 0; padding-left: 2em; }
+.reader-html-content li { margin-bottom: 0.5em; }
+.reader-html-content table { width: 100%; border-collapse: collapse; margin: 1.5em 0; }
+.reader-html-content th, .reader-html-content td { padding: 0.5em 0.75em; border: 1px solid rgba(128,128,128,0.3); text-align: left; }
+.reader-html-content th { font-weight: 600; background: rgba(128,128,128,0.1); }
+.reader-html-content hr { margin: 2em 0; border: none; border-top: 1px solid rgba(128,128,128,0.3); }
+.reader-html-content a { color: #e5a349; text-decoration: underline; cursor: pointer; }
+.reader-html-content a:hover { opacity: 0.8; }
+.reader-html-content sup, .reader-html-content sub { font-size: 0.75em; }
+.reader-html-content sup { vertical-align: super; }
+.reader-html-content sub { vertical-align: sub; }
+.reader-html-content center { text-align: center; }
+.reader-html-content .epub-image, .reader-html-content .illustration { max-width: 100%; height: auto; margin: 1.5em auto; display: block; }
+.reader-html-content mark, .reader-html-content .vocab-mark {
+  background: rgba(229,163,73,0.3) !important;
+  border-bottom: 2px solid #e5a349 !important;
+  padding: 0 2px !important;
+  border-radius: 2px !important;
+  cursor: pointer !important;
+  color: inherit !important;
+}
+.reader-html-content .user-highlight {
+  background: rgba(99,179,237,0.28) !important;
+  border-bottom: 2px solid #63b3ed !important;
+  cursor: pointer !important;
+  color: inherit !important;
+}
+.reader-theme-dark .reader-html-content a { color: #e5a349; }
+.reader-theme-sepia .reader-html-content a { color: #8b6914; }
+.reader-theme-light .reader-html-content a { color: #c47a1a; }
+`;
+
+// iframe 内交互脚本（纯 JS，postMessage 与父窗口桥接）
+const IFRAME_INTERACTION_SCRIPT = `
+(function(){
+  var DOC = document;
+  function post(msg){ msg.source = 'lingua-reader-iframe'; try{ parent.postMessage(msg, '*'); }catch(e){} }
+  var cleanHtml = '';
+
+  function cleanWord(w, isPhrase){
+    if(isPhrase) return w.trim().replace(/^[\\p{P}\\p{S}]+|[\\p{P}\\p{S}]+$/gu, '');
+    return w.replace(/[\\p{P}\\p{S}]/gu, '');
+  }
+  function closestBlock(node){
+    var el = (node && node.nodeType === 3) ? node.parentNode : node;
+    while(el && el !== DOC.body){
+      var t = el.tagName ? el.tagName.toLowerCase() : '';
+      if(t === 'p' || t === 'div' || t === 'li' || t === 'blockquote' || t === 'td' || t === 'th' || t === 'section' || t === 'article') return el;
+      el = el.parentNode;
+    }
+    return DOC.body;
+  }
+  function getSentence(block, raw){
+    var full = block ? (block.textContent || '') : '';
+    var idx = full.toLowerCase().indexOf(raw.toLowerCase());
+    if(idx < 0) return '';
+    var s = idx; while(s > 0 && !/[.!?。！？\\n]/.test(full[s-1])) s--;
+    var e = idx + raw.length; while(e < full.length && !/[.!?。！？\\n]/.test(full[e])) e++;
+    return full.slice(s, e).trim();
+  }
+  function getWordInfo(x, y){
+    var range = null;
+    if(DOC.caretRangeFromPoint) range = DOC.caretRangeFromPoint(x, y);
+    else if(DOC.caretPositionFromPoint){ var cp = DOC.caretPositionFromPoint(x, y); if(cp){ range = DOC.createRange(); range.setStart(cp.offsetNode, cp.offset); range.collapse(true); } }
+    if(!range) return null;
+    var node = range.startContainer;
+    if(node.nodeType !== 3){
+      var el = node.nodeType === 1 ? node : node.parentNode;
+      var txt = el && el.textContent ? el.textContent.trim() : '';
+      if(txt){ var w = cleanWord(txt, txt.indexOf(' ') > 0); if(w.length >= 2){ return { word: w, sentence: getSentence(closestBlock(el), txt) }; } }
+      return null;
+    }
+    var text = node.nodeValue; var off = range.startOffset;
+    var st = off, en = off;
+    while(st > 0 && /[\\p{L}\\p{M}\\p{Pd}’']/u.test(text[st-1])) st--;
+    while(en < text.length && /[\\p{L}\\p{M}\\p{Pd}’']/u.test(text[en])) en++;
+    var raw = text.slice(st, en); if(!raw) return null;
+    var word = cleanWord(raw, raw.indexOf(' ') > 0); if(word.length < 2) return null;
+    return { word: word, sentence: getSentence(closestBlock(node), raw) };
+  }
+
+  function applySettings(s){
+    DOC.documentElement.style.setProperty('--reader-font', s.fontSize + 'px');
+    DOC.documentElement.style.setProperty('--reader-line', String(s.lineHeight));
+    DOC.body.className = 'reader-html-content reader-theme-' + s.theme;
+  }
+
+  function applyMarks(wordsSet){
+    if(!wordsSet || !wordsSet.size) return;
+    var walker = DOC.createTreeWalker(DOC.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(n){
+        if(!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        var p = n.parentNode; if(p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    var nodes = []; var n; while(n = walker.nextNode()) nodes.push(n);
+    for(var i=0;i<nodes.length;i++){
+      var node = nodes[i]; var text = node.nodeValue;
+      var parts = text.split(/([^\\p{L}\\p{M}\\u2010-\\u2015']+)/gu);
+      var frag = DOC.createDocumentFragment(); var changed = false;
+      for(var j=0;j<parts.length;j++){
+        var part = parts[j]; if(!part) continue;
+        if(/[\\p{L}\\p{M}]/u.test(part)){
+          var clean = part.replace(/[\\p{P}\\p{S}]/gu, '').toLowerCase();
+          if(clean && wordsSet.has(clean) && clean.length >= 2){
+            var m = DOC.createElement('mark'); m.className = 'vocab-mark'; m.textContent = part; frag.appendChild(m); changed = true; continue;
+          }
+        }
+        frag.appendChild(DOC.createTextNode(part));
+      }
+      if(changed) node.parentNode.replaceChild(frag, node);
+    }
+  }
+
+  function applyHighlights(list){
+    if(!list || !list.length) return;
+    var items = list.slice().sort(function(a,b){ return b.text.length - a.text.length; });
+    for(var k=0;k<items.length;k++){
+      var it = items[k]; if(!it.text) continue;
+      var t = it.text;
+      var walker = DOC.createTreeWalker(DOC.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(n){
+          if(!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          var p = n.parentNode; if(p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE' || (p.closest && p.closest('[data-highlight-id]')))) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var nodes = []; var nd; while(nd = walker.nextNode()) nodes.push(nd);
+      for(var a=0;a<nodes.length;a++){
+        var node = nodes[a]; var text = node.nodeValue; var from = 0; var changed = false;
+        var frag = DOC.createDocumentFragment();
+        while(true){
+          var idx = text.indexOf(t, from); if(idx < 0){ frag.appendChild(DOC.createTextNode(text.slice(from))); break; }
+          if(idx > from) frag.appendChild(DOC.createTextNode(text.slice(from, idx)));
+          var span = DOC.createElement('span'); span.setAttribute('data-highlight-id', it.id); span.className = 'user-highlight'; span.textContent = text.slice(idx, idx + t.length); frag.appendChild(span); changed = true; from = idx + t.length;
+        }
+        if(changed) node.parentNode.replaceChild(frag, node);
+      }
+    }
+  }
+
+  var currentMarks = new Set();
+  var currentHighlights = [];
+  function applyAll(){
+    DOC.body.innerHTML = cleanHtml;
+    applyMarks(currentMarks);
+    applyHighlights(currentHighlights);
+  }
+
+  // 事件委托（对 innerHTML 重置鲁棒）
+  DOC.addEventListener('click', function(e){
+    var hl = e.target.closest ? e.target.closest('[data-highlight-id]') : null;
+    if(hl){ post({ type: 'highlightClick', id: hl.getAttribute('data-highlight-id') }); return; }
+    var sel = window.getSelection();
+    if(sel && !sel.isCollapsed) return;
+    var info = getWordInfo(e.clientX, e.clientY);
+    if(info){ post({ type: 'word', word: info.word, sentence: info.sentence }); }
+  });
+  DOC.addEventListener('mouseup', function(){
+    var sel = window.getSelection();
+    if(sel && !sel.isCollapsed){
+      var t = sel.toString().trim();
+      if(t.length >= 2) post({ type: 'selection', text: t });
+    }
+  });
+
+  // 首次加载后保存"干净"内容，供后续重新应用高亮/标记
+  cleanHtml = DOC.body.innerHTML;
+
+  // 接收父窗口下发的状态（设置/标记/高亮/滚动）
+  window.addEventListener('message', function(ev){
+    var d = ev.data; if(!d || d.source !== 'lingua-reader-parent') return;
+    if(d.type === 'applySettings'){ applySettings(d); }
+    else if(d.type === 'applyMarks'){ currentMarks = new Set(d.words || []); applyAll(); }
+    else if(d.type === 'applyHighlights'){ currentHighlights = d.highlights || []; applyAll(); }
+    else if(d.type === 'restoreScroll'){ try{ window.scrollTo(0, d.y || 0); }catch(e){} }
+    else if(d.type === 'scrollToHighlight'){ var el = DOC.querySelector('[data-highlight-id="' + d.id + '"]'); if(el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  });
+
+  post({ type: 'ready' });
+})();
+`;
+
+function buildSrcDoc(
+  content: string,
+  bookCss: string,
+  settings: { fontSize: number; lineHeight: number; theme: string },
+): string {
+  const themeClass = `reader-theme-${settings.theme}`;
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${READER_BASE_CSS}</style>
+<style>${bookCss || ''}</style>
+</head>
+<body class="reader-html-content ${themeClass}">
+${content}
+<script>${IFRAME_INTERACTION_SCRIPT}<\/script>
+</body>
+</html>`;
 }
 
 function parseHtmlToReact(
