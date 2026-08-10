@@ -621,6 +621,37 @@ export class EPUBParser {
   }
 
   /**
+   * 按“相对当前章节”的 href 直接读取 EPUB 内任意资源文件的原始文本（用于脚注/尾注跨文件跳转）。
+   * 例如脚注链接 notes.xhtml#note1：href='notes.xhtml#note1'，baseHref=当前章节路径，
+   * 解析出 notes.xhtml 的真实 zip 路径后从 JSZip 读取原文（不做 processHTML，保留原始结构以便按 id 定位）。
+   */
+  async getResourceRaw(href: string, baseHref: string): Promise<string | null> {
+    try {
+      const archive = this.book.archive;
+      if (!archive || !archive.zip) return null;
+      const target = href.split('#')[0];
+      let resolved = resolveBookPath(baseHref, target);
+      if (!resolved) return null;
+      let entry = archive.zip.files[resolved] || archive.zip.files[resolved.toLowerCase()];
+      if (!entry) {
+        // 兜底：按文件名（basename）在 zip 中匹配（应对链接用 OPF 绝对路径、zip 键大小写不一等情况）
+        const base = resolved.split('/').pop()?.toLowerCase();
+        if (base) {
+          for (const key of Object.keys(archive.zip.files)) {
+            const k = key.toLowerCase();
+            if (k === base || k.endsWith('/' + base)) { entry = archive.zip.files[key]; break; }
+          }
+        }
+      }
+      if (!entry) return null;
+      return await entry.async('string');
+    } catch (e) {
+      console.warn('[EPUB] getResourceRaw failed:', href, e);
+      return null;
+    }
+  }
+
+  /**
    * 处理 HTML：清理危险标签，替换图片 src 为 base64
    * 保留所有原始格式、样式、布局
    */

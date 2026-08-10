@@ -382,6 +382,8 @@ export function Reader({
   const [dictionaryData, setDictionaryData] = useState<DictionaryDefinition | null>(null);
   const [dictLoading, setDictLoading] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true);
+  // 脚注/尾注弹层：点击脚注跳转链接时显示脚注正文（隔离 iframe 无法跨文件导航，改为就地弹内容）
+  const [footnotePopover, setFootnotePopover] = useState<{ text: string; top: number; left: number } | null>(null);
 
   // ===== 性能优化：词典/AI 结果缓存 =====
   // 同一本书内重复点击同一单词很常见（复习）。缓存命中时跳过网络请求，
@@ -767,6 +769,9 @@ export function Reader({
     iframeLoadedRef.current = false;
   }, [chapterContent]);
 
+  // 章节切换时关闭脚注弹层（避免锚点失效后弹层残留错位）
+  useEffect(() => { setFootnotePopover(null); }, [currentChapter]);
+
   // 设置变化：仅更新样式（不重建 innerHTML，保留滚动位置）
   useEffect(() => {
     const f = iframeRef.current;
@@ -841,6 +846,9 @@ export function Reader({
   contentsRef.current = contents;
   const parserRef = useRef(parser);
   parserRef.current = parser;
+  // 当前章节的 EPUB 内路径（相对 OPF 目录），供脚注跨文件解析用，避免闭包过期
+  const currentChapterHrefRef = useRef('');
+  currentChapterHrefRef.current = (flatChapters[currentChapter] && flatChapters[currentChapter].href) || '';
 
   // 获取单词周围的上下文
   // 辅助函数：从 HTML 提取纯文本
@@ -1300,27 +1308,13 @@ export function Reader({
       }
     }
     // 链接（脚注/尾注/交叉引用）：阻止默认导航，避免主窗口/EPUB 内容被带走到不存在的 href。
-    // 同文档锚点命中则就地滚动并短暂高亮；跨文件链接仅阻止导航。
+    // 脚注类链接改为"就地弹脚注内容"（同文档直接定位；跨文件经 parser 解析）。其余内部链接仅阻止导航。
     const anchorEl = target.closest('a') as HTMLAnchorElement | null;
     if (anchorEl && anchorEl.getAttribute('href')) {
       e.preventDefault();
       const href = anchorEl.getAttribute('href') || '';
-      const hashIdx = href.indexOf('#');
-      if (hashIdx >= 0) {
-        const id = href.slice(hashIdx + 1);
-        if (id) {
-          const dest = document.getElementById(id);
-          if (dest) {
-            try {
-              const d = dest as HTMLElement;
-              d.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              const prev = d.style.outline;
-              d.style.outline = '2px solid #e5a349';
-              setTimeout(() => { d.style.outline = prev; }, 1500);
-            } catch (_) { /* ignore */ }
-            return;
-          }
-        }
+      if (iframeIsFootnoteRef(anchorEl)) {
+        void showFootnotePopover(document, anchorEl, href);
       }
       return;
     }
@@ -1367,6 +1361,45 @@ export function Reader({
 
   // iframe 内"单击"：优先命中高亮（弹笔记），否则按坐标取词查词。
   // 注：在 iframe 文档上监听，事件 target/clientX 都属于 iframe 坐标系，与父窗口无关。
+  // 点击脚注/尾注跳转链接：解析脚注正文并以弹层显示（隔离 iframe 无法跨文件导航，改为就地弹内容）。
+  const showFootnotePopover = useCallback(async (doc: Document, anchorEl: HTMLAnchorElement, href: string) => {
+    const hashIdx = href.indexOf('#');
+    const fragment = hashIdx >= 0 ? href.slice(hashIdx + 1) : '';
+    if (!fragment) return;
+    const filePart = hashIdx >= 0 ? href.slice(0, hashIdx).trim() : href.trim();
+    let text: string | null = null;
+    if (!filePart) {
+      // 同文档锚点：直接在 iframe 文档内按 id 定位
+      const el = doc.getElementById(fragment);
+      if (el) text = extractFootnoteText(el);
+    } else {
+      // 跨文件：读取目标 xhtml 原文并按 id 定位脚注（EPUB 多把全书脚注集中放 notes.xhtml）
+      const parser = parserRef.current as any;
+      const base = currentChapterHrefRef.current;
+      if (parser && typeof parser.getResourceRaw === 'function') {
+        const raw = await parser.getResourceRaw(href, base);
+        if (raw) {
+          try {
+            const parsed = new DOMParser().parseFromString(raw, 'text/html');
+            const el = parsed.getElementById(fragment);
+            if (el) text = extractFootnoteText(el);
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+    if (!text) return;
+    // 弹层位置：iframe 内坐标 + iframe 在父窗口的位置（均为 viewport 相对，配合 position: fixed）
+    const aRect = anchorEl.getBoundingClientRect();
+    const fRect = iframeRef.current ? iframeRef.current.getBoundingClientRect() : null;
+    const baseTop = fRect ? fRect.top : 0;
+    const baseLeft = fRect ? fRect.left : 0;
+    let top = baseTop + aRect.top + aRect.height + 6;
+    let left = baseLeft + aRect.left;
+    left = Math.min(left, window.innerWidth - 340);
+    left = Math.max(8, left);
+    setFootnotePopover({ text, top, left });
+  }, []);
+
   const onIframeClick = useCallback((e: Event) => {
     const f = iframeRef.current;
     const doc = f && f.contentDocument;
@@ -1390,36 +1423,23 @@ export function Reader({
     }
     // 链接（脚注/尾注/交叉引用跳转）：隔离 iframe 解析不了 EPUB 内部链接，
     // 不阻止默认行为会让 iframe 导航到不存在的 href → 整页黑屏。
-    // 处理：一律 preventDefault；同文档锚点命中则就地平滑滚动并短暂高亮，否则仅阻止导航。
+    // 处理：一律 preventDefault；脚注类链接改为"就地弹脚注内容"（跨文件也能解析），
+    // 其余内部链接仅阻止导航、不跳转。
     const anchorEl = target && target.closest ? (target.closest('a') as HTMLAnchorElement | null) : null;
     if (anchorEl && anchorEl.getAttribute('href')) {
       e.preventDefault();
       const href = anchorEl.getAttribute('href') || '';
-      const hashIdx = href.indexOf('#');
-      if (hashIdx >= 0) {
-        const id = href.slice(hashIdx + 1);
-        if (id) {
-          const dest = doc.getElementById(id);
-          if (dest) {
-            try {
-              const d = dest as HTMLElement;
-              d.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              const prev = d.style.outline;
-              d.style.outline = '2px solid #e5a349';
-              setTimeout(() => { d.style.outline = prev; }, 1500);
-            } catch (_) { /* ignore */ }
-            return;
-          }
-        }
+      if (iframeIsFootnoteRef(anchorEl)) {
+        void showFootnotePopover(doc, anchorEl, href);
       }
-      return; // 跨文件链接在隔离 iframe 内不可解析：仅阻止导航，不跳转
+      return;
     }
     const me = e as MouseEvent;
     const info = iframeGetWordInfo(doc, me.clientX, me.clientY);
     if (info && info.word && info.word.length >= 2) {
       handleWordClickRef.current(info.word, info.sentence || undefined);
     }
-  }, []);
+  }, [showFootnotePopover]);
 
   // iframe 内"选词"：用户框选文本后弹出操作面板（解析/下划线/笔记）。
   const onIframeMouseup = useCallback(() => {
@@ -2280,6 +2300,45 @@ export function Reader({
           }
         }} 
       />
+
+      {/* 脚注/尾注弹层：点击脚注跳转链接时显示脚注正文（隔离 iframe 无法跨文件导航，改为就地弹内容） */}
+      {footnotePopover && (
+        <>
+          <div
+            onClick={() => setFootnotePopover(null)}
+            style={{ position: 'fixed', inset: 0, zIndex: 90 }}
+          />
+          <div
+            style={{
+              position: 'fixed',
+              top: footnotePopover.top,
+              left: footnotePopover.left,
+              zIndex: 91,
+              maxWidth: 320,
+              maxHeight: '40vh',
+              overflowY: 'auto',
+              background: settings.theme === 'dark' ? '#26282b' : '#fffdf7',
+              color: settings.theme === 'dark' ? '#e0e0e0' : '#2c2c2c',
+              border: '1px solid rgba(229,163,73,0.6)',
+              borderRadius: 8,
+              padding: '10px 12px',
+              boxShadow: '0 6px 24px rgba(0,0,0,0.25)',
+              fontSize: Math.max(13, settings.fontSize * 0.85),
+              lineHeight: 1.6,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <span style={{ fontSize: 11, opacity: 0.6, letterSpacing: 1 }}>脚注</span>
+              <button
+                onClick={() => setFootnotePopover(null)}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 16, lineHeight: 1, opacity: 0.6 }}
+                aria-label="关闭"
+              >×</button>
+            </div>
+            <div>{footnotePopover.text}</div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2532,22 +2591,30 @@ function iframeGetWordInfo(doc: Document, x: number, y: number): { word: string;
   const word = iframeCleanWord(raw, raw.indexOf(' ') > 0); if (word.length < 2) return null;
   return { word, sentence: iframeGetSentence(node.parentNode as HTMLElement, raw) };
 }
+// 判断一个 <a> 是否为脚注/尾注/交叉引用跳转（用于上标样式与"点击弹脚注"）。
+function iframeIsFootnoteRef(a: Element): boolean {
+  const href = (a.getAttribute('href') || '').toLowerCase();
+  const epubType = (a.getAttribute('epub:type') || '').toLowerCase();
+  const id = (a.getAttribute('id') || '').toLowerCase();
+  const cls = (' ' + (a.getAttribute('class') || '') + ' ').toLowerCase();
+  const txt = (a.textContent || '').trim();
+  const reNote = /noteref|noteback|referrer|note-ref|footnote|endnote|\bfn\b/;
+  const isNoteRef = reNote.test(epubType + ' ' + href + ' ' + id + ' ' + cls);
+  const looksLikeNumber = /^[\[\(]?\d+[\]\)]?$/.test(txt);
+  return isNoteRef || (looksLikeNumber && /#/.test(href) && /note|fn|back/.test(href));
+}
+// 提取脚注正文文本：去掉脚注内的"返回正文"链接，合并空白。
+function extractFootnoteText(el: Element): string {
+  const clone = el.cloneNode(true) as Element;
+  clone.querySelectorAll('a').forEach(a => a.remove());
+  return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+}
 function iframeMarkFootnoteRefs(doc: Document) {
   const as = doc.querySelectorAll('a');
-  const reNote = /noteref|noteback|referrer|note-ref|footnote|endnote|\bfn\b/;
   for (let i = 0; i < as.length; i++) {
     const a = as[i] as HTMLElement;
     if (a.classList.contains('reader-force-sup')) continue;
-    const href = (a.getAttribute('href') || '').toLowerCase();
-    const epubType = (a.getAttribute('epub:type') || '').toLowerCase();
-    const id = (a.getAttribute('id') || '').toLowerCase();
-    const cls = (' ' + (a.className || '') + ' ').toLowerCase();
-    const txt = (a.textContent || '').trim();
-    const isNoteRef = reNote.test(epubType + ' ' + href + ' ' + id + ' ' + cls);
-    const looksLikeNumber = /^[\[\(]?\d+[\]\)]?$/.test(txt);
-    if (isNoteRef || (looksLikeNumber && /#/.test(href) && /note|fn|back/.test(href))) {
-      a.classList.add('reader-force-sup');
-    }
+    if (iframeIsFootnoteRef(a)) a.classList.add('reader-force-sup');
   }
 }
 function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
