@@ -1299,6 +1299,31 @@ export function Reader({
         }
       }
     }
+    // 链接（脚注/尾注/交叉引用）：阻止默认导航，避免主窗口/EPUB 内容被带走到不存在的 href。
+    // 同文档锚点命中则就地滚动并短暂高亮；跨文件链接仅阻止导航。
+    const anchorEl = target.closest('a') as HTMLAnchorElement | null;
+    if (anchorEl && anchorEl.getAttribute('href')) {
+      e.preventDefault();
+      const href = anchorEl.getAttribute('href') || '';
+      const hashIdx = href.indexOf('#');
+      if (hashIdx >= 0) {
+        const id = href.slice(hashIdx + 1);
+        if (id) {
+          const dest = document.getElementById(id);
+          if (dest) {
+            try {
+              const d = dest as HTMLElement;
+              d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              const prev = d.style.outline;
+              d.style.outline = '2px solid #e5a349';
+              setTimeout(() => { d.style.outline = prev; }, 1500);
+            } catch (_) { /* ignore */ }
+            return;
+          }
+        }
+      }
+      return;
+    }
     const result = extractWordFromClick(e);
     if (result) {
       setSidebarMode('word');
@@ -1362,6 +1387,32 @@ export function Reader({
           return;
         }
       }
+    }
+    // 链接（脚注/尾注/交叉引用跳转）：隔离 iframe 解析不了 EPUB 内部链接，
+    // 不阻止默认行为会让 iframe 导航到不存在的 href → 整页黑屏。
+    // 处理：一律 preventDefault；同文档锚点命中则就地平滑滚动并短暂高亮，否则仅阻止导航。
+    const anchorEl = target && target.closest ? (target.closest('a') as HTMLAnchorElement | null) : null;
+    if (anchorEl && anchorEl.getAttribute('href')) {
+      e.preventDefault();
+      const href = anchorEl.getAttribute('href') || '';
+      const hashIdx = href.indexOf('#');
+      if (hashIdx >= 0) {
+        const id = href.slice(hashIdx + 1);
+        if (id) {
+          const dest = doc.getElementById(id);
+          if (dest) {
+            try {
+              const d = dest as HTMLElement;
+              d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              const prev = d.style.outline;
+              d.style.outline = '2px solid #e5a349';
+              setTimeout(() => { d.style.outline = prev; }, 1500);
+            } catch (_) { /* ignore */ }
+            return;
+          }
+        }
+      }
+      return; // 跨文件链接在隔离 iframe 内不可解析：仅阻止导航，不跳转
     }
     const me = e as MouseEvent;
     const info = iframeGetWordInfo(doc, me.clientX, me.clientY);
