@@ -2329,9 +2329,37 @@ body { margin: 0; padding: 0; }
 .reader-html-content hr { margin: 2em 0; border: none; border-top: 1px solid rgba(128,128,128,0.3); }
 .reader-html-content a { color: #e5a349; text-decoration: underline; cursor: pointer; }
 .reader-html-content a:hover { opacity: 0.8; }
-.reader-html-content sup, .reader-html-content sub { font-size: 0.75em; }
-.reader-html-content sup { vertical-align: super; }
-.reader-html-content sub { vertical-align: sub; }
+.reader-html-content sup, .reader-html-content sub { font-size: 0.65em !important; line-height: 0 !important; }
+.reader-html-content sup { vertical-align: super !important; }
+.reader-html-content sub { vertical-align: sub !important; }
+
+/* 兜底：常见 EPUB 脚注/尾注/引用角标，即使书籍 CSS 把它们 reset 成正文也要保持上标小字号 */
+.reader-html-content a[epub\:type~="noteref"],
+.reader-html-content a[epub\:type~="noteback"],
+.reader-html-content a[epub\:type~="referrer"],
+.reader-html-content .noteref,
+.reader-html-content .noteRef,
+.reader-html-content .noteback,
+.reader-html-content .footnote-ref,
+.reader-html-content .endnote-ref,
+.reader-html-content .note-ref,
+.reader-html-content .fn,
+.reader-html-content .fnref,
+.reader-html-content .fn-ref,
+.reader-html-content .pgk-fn,
+.reader-html-content .reference,
+.reader-html-content .ref,
+.reader-html-content .cite,
+.reader-html-content .en,
+.reader-html-content .calibre_4,
+.reader-html-content .calibre_5,
+.reader-html-content .calibre_6,
+.reader-html-content .reader-force-sup,
+.reader-html-content .reader-force-sup * {
+  vertical-align: super !important;
+  font-size: 0.65em !important;
+  line-height: 0 !important;
+}
 .reader-html-content center { text-align: center; }
 .reader-html-content .epub-image, .reader-html-content .illustration { max-width: 100%; height: auto; margin: 1.5em auto; display: block; }
 .reader-html-content mark, .reader-html-content .vocab-mark {
@@ -2465,10 +2493,31 @@ const IFRAME_INTERACTION_SCRIPT = `
 
   var currentMarks = new Set();
   var currentHighlights = [];
+
+  function markFootnoteRefs(){
+    var as = DOC.querySelectorAll('a');
+    var reNote = /noteref|noteback|referrer|note-ref|footnote|endnote|\bfn\b/;
+    for(var i=0;i<as.length;i++){
+      var a = as[i];
+      if(a.classList.contains('reader-force-sup')) continue;
+      var href = (a.getAttribute('href') || '').toLowerCase();
+      var epubType = (a.getAttribute('epub:type') || '').toLowerCase();
+      var id = (a.getAttribute('id') || '').toLowerCase();
+      var cls = (' ' + (a.className || '') + ' ').toLowerCase();
+      var txt = (a.textContent || '').trim();
+      var isNoteRef = reNote.test(epubType + ' ' + href + ' ' + id + ' ' + cls);
+      var looksLikeNumber = /^[\[\(]?\d+[\]\)]?$/.test(txt);
+      if(isNoteRef || (looksLikeNumber && /#/.test(href) && /note|fn|back/.test(href))){
+        a.classList.add('reader-force-sup');
+      }
+    }
+  }
+
   function applyAll(){
     DOC.body.innerHTML = cleanHtml;
     applyMarks(currentMarks);
     applyHighlights(currentHighlights);
+    markFootnoteRefs();
   }
 
   // 事件委托（对 innerHTML 重置鲁棒）
@@ -2489,6 +2538,7 @@ const IFRAME_INTERACTION_SCRIPT = `
   });
 
   // 首次加载后保存"干净"内容，供后续重新应用高亮/标记
+  markFootnoteRefs();
   cleanHtml = DOC.body.innerHTML;
 
   // 接收父窗口下发的状态（设置/标记/高亮/滚动）
@@ -2516,8 +2566,8 @@ function buildSrcDoc(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>${READER_BASE_CSS}</style>
 <style>${bookCss || ''}</style>
+<style>${READER_BASE_CSS}</style>
 </head>
 <body class="reader-html-content ${themeClass}">
 ${content}
