@@ -1372,7 +1372,6 @@ export function Reader({
       // 同文档锚点：用 resolveFootnoteElement 定位，因为精确 id 有时命中纯编号的 <a>，需向上找正文容器
       const el = resolveFootnoteElement(doc, fragment);
       if (el) text = extractFootnoteText(el);
-      console.log('[footnote] same-doc', fragment, el, text);
     } else {
       // 跨文件：读取目标 xhtml 原文并按 id 定位脚注（EPUB 多把全书脚注集中放 notes.xhtml）
       const parser = parserRef.current as any;
@@ -1384,7 +1383,6 @@ export function Reader({
             const parsed = new DOMParser().parseFromString(raw, 'text/html');
             const el = resolveFootnoteElement(parsed, fragment);
             if (el) text = extractFootnoteText(el);
-            console.log('[footnote] cross-file', fragment, el, text);
           } catch (_) { /* ignore */ }
         }
       }
@@ -2311,33 +2309,51 @@ export function Reader({
             style={{ position: 'fixed', inset: 0, zIndex: 90 }}
           />
           <div
+            className="footnote-popover"
             style={{
               position: 'fixed',
               top: footnotePopover.top,
               left: footnotePopover.left,
               zIndex: 91,
-              maxWidth: 320,
-              maxHeight: '40vh',
+              maxWidth: 360,
+              maxHeight: 'min(42vh, 360px)',
               overflowY: 'auto',
               background: settings.theme === 'dark' ? '#26282b' : '#fffdf7',
               color: settings.theme === 'dark' ? '#e0e0e0' : '#2c2c2c',
               border: '1px solid rgba(229,163,73,0.6)',
-              borderRadius: 8,
-              padding: '10px 12px',
-              boxShadow: '0 6px 24px rgba(0,0,0,0.25)',
-              fontSize: Math.max(13, settings.fontSize * 0.85),
-              lineHeight: 1.6,
+              borderRadius: 10,
+              padding: '12px 14px 14px',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.22)',
+              fontSize: Math.max(12, settings.fontSize * 0.78),
+              lineHeight: 1.7,
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontSize: 11, opacity: 0.6, letterSpacing: 1 }}>脚注</span>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 8,
+                paddingBottom: 6,
+                borderBottom: `1px solid ${settings.theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)'}`,
+              }}
+            >
+              <span style={{ fontSize: 11, opacity: 0.55, letterSpacing: 1.2, fontWeight: 500 }}>脚注</span>
               <button
                 onClick={() => setFootnotePopover(null)}
-                style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 16, lineHeight: 1, opacity: 0.6 }}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 18, lineHeight: 1, opacity: 0.5, padding: '0 2px' }}
                 aria-label="关闭"
               >×</button>
             </div>
-            <div>{footnotePopover.text}</div>
+            <div
+              style={{
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                overflowWrap: 'break-word',
+              }}
+            >
+              {footnotePopover.text}
+            </div>
           </div>
         </>
       )}
