@@ -380,17 +380,35 @@ textarea:focus-visible {
 
 /* 兜底：常见 EPUB 脚注/尾注/参考文献角标，即使书籍 CSS 作用域失败也保持小字号上标 */
 .reader-html-content a[href^="#"],
+.reader-html-content a[epub\:type~="noteref"],
 .reader-html-content .noteref,
 .reader-html-content .footnote,
+.reader-html-content .footnote-ref,
 .reader-html-content .endnote,
+.reader-html-content .endnote-ref,
 .reader-html-content .note-ref,
+.reader-html-content .note,
 .reader-html-content .reference,
 .reader-html-content .ref,
+.reader-html-content .cite,
 .reader-html-content .fn,
-.reader-html-content .en {
+.reader-html-content .fnref,
+.reader-html-content .en,
+.reader-html-content .calibre_4,
+.reader-html-content .calibre_5,
+.reader-html-content .calibre_6 {
   font-size: 0.75em;
   vertical-align: super;
   line-height: 0;
+}
+
+/* 引文/注释类：通常比正文小一号，避免与正文同大 */
+.reader-html-content blockquote,
+.reader-html-content .citation,
+.reader-html-content .source,
+.reader-html-content .epigraph,
+.reader-html-content .quote {
+  font-size: 0.92em;
 }
 
 .reader-html-content center {

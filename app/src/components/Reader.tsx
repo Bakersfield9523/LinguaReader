@@ -368,7 +368,12 @@ export function Reader({
   const [loading, setLoading] = useState(true);
   const [parser, setParser] = useState<EPUBParser | PDFParser | null>(null);
   const [contents, setContents] = useState<Map<string, string>>(new Map());
-  
+  // 各章节的书籍自带样式表（id -> css），供初始章节/切换章节注入，避免"打开书第一个章节完全没有书籍样式"
+  const [cssContents, setCssContents] = useState<Map<string, string>>(new Map());
+  // EPUB 渲染模式：'iframe' 用 iframe + 原书完整 CSS 原样渲染（最大化保留原书格式，参考 koodo-reader）；
+  // 'react' 用原 React 重建 DOM 渲染（兜底/兼容）。默认 iframe。
+  const [epubRenderMode, setEpubRenderMode] = useState<'iframe' | 'react'>('iframe');
+
   // 单词选择状态
   const [selectedWord, setSelectedWord] = useState<string | null>(null);
   const selectedSentenceRef = useRef<string>('');
@@ -505,8 +510,13 @@ export function Reader({
 
   const contentRef = useRef<HTMLDivElement>(null);
   const htmlContentRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null); // EPUB iframe 渲染容器
   const justSelectedRef = useRef(false); // 阻止 onClick 覆盖 onMouseUp 的 selection 状态
   const pendingScrollHighlightRef = useRef<string | null>(null); // 待滚动到的高亮 ID（从侧边栏点击笔记时设置）
+  const highlightsRef = useRef<Highlight[]>([]); // iframe 桥接用：始终持有最新高亮列表
+  highlightsRef.current = highlights;
+  const iframeCleanHtmlRef = useRef(''); // iframe 内"干净内容"基线（load 后捕获，用于重应用高亮/标记）
+  const iframeLoadedRef = useRef(false); // iframe 是否已加载完成（协调 marks 效果与 onLoad）
 
   // 获取已标记的单词集合（useMemo 避免每次渲染重建 Set）
   const markedWords = useMemo(
@@ -527,14 +537,25 @@ export function Reader({
   // DOM mutation effect 整段删除（之前 ~120 行 + 各种边界 case 全部不再需要）。
   useEffect(() => {
     // 保留滚动到高亮的副作用
-    if (pendingScrollHighlightRef.current && htmlContentRef.current) {
-      const targetEl = htmlContentRef.current.querySelector(`[data-highlight-id="${pendingScrollHighlightRef.current}"]`);
+    const hlId = pendingScrollHighlightRef.current;
+    if (!hlId) return;
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      // iframe 模式下高亮在 iframe 内，直接操作 contentDocument 滚动到该高亮
+      const f = iframeRef.current;
+      const doc = f && f.contentDocument;
+      const el = doc && doc.querySelector(`[data-highlight-id="${hlId}"]`);
+      if (el) (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
+      pendingScrollHighlightRef.current = null;
+      return;
+    }
+    if (htmlContentRef.current) {
+      const targetEl = htmlContentRef.current.querySelector(`[data-highlight-id="${hlId}"]`);
       if (targetEl) {
         targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
       pendingScrollHighlightRef.current = null;
     }
-  }, [chapterContent, currentChapter]);
+  }, [chapterContent, currentChapter, epubRenderMode, book.format]);
 
   // 切换章节展开状态
   const toggleExpand = useCallback((chapterId: string) => {
@@ -580,7 +601,7 @@ export function Reader({
         // 打开书时立即更新 lastReadAt，确保书架排序正确
         onUpdateProgress(book.id, book.progress || 0, book.currentChapter);
 
-        const { parser, chapters: loadedChapters, contents: loadedContents } = await getBookContent(book);
+        const { parser, chapters: loadedChapters, contents: loadedContents, cssContents: loadedCss } = await getBookContent(book);
         
         if (!isMounted) return;
         
@@ -600,6 +621,7 @@ export function Reader({
         setParser(parser);
         setChapters(loadedChapters);
         setContents(loadedContents);
+        setCssContents(loadedCss);
 
         // 使用 book.currentChapter prop（最新值），而不是 stale 的 state
         const initialChapter = Math.min(
@@ -612,10 +634,14 @@ export function Reader({
         const currentChapterId = flat[initialChapter]?.id;
         if (currentChapterId && loadedContents.has(currentChapterId)) {
           setChapterContent(loadedContents.get(currentChapterId) || '');
+          // 关键修复：初始章节也要同步注入该章节的书籍 CSS，
+          // 否则打开书看到的第一个章节完全没有书籍样式（角标/引用/首字下沉等排版全部丢失）。
+          setBookCss(loadedCss.get(currentChapterId) || '');
         } else if (flat.length > 0) {
           // 如果当前章节不存在，加载第一章
           const firstChapterId = flat[0].id;
           setChapterContent(loadedContents.get(firstChapterId) || '');
+          setBookCss(loadedCss.get(firstChapterId) || '');
           setCurrentChapter(0);
         }
       } catch (error) {
@@ -726,11 +752,45 @@ export function Reader({
 
     // 滚动到顶部
     contentRef.current?.scrollTo(0, 0);
-  }, [flatChapters, contents, parser, book.id, onUpdateProgress, loadBookmarks, loadHighlights]);
+    // iframe 模式下新章节 srcDoc 重新加载，自动回到顶部
+    if (epubRenderMode === 'iframe') scrollPosRef.current = 0;
+  }, [flatChapters, contents, parser, book.id, onUpdateProgress, loadBookmarks, loadHighlights, epubRenderMode]);
+
+  // ============ EPUB iframe 渲染：父窗口直接操作 iframe.contentDocument ============
+  // 不依赖 postMessage / 内联脚本（Tauri CSP 会拦截内联脚本）。所有交互由父窗口
+  // 打包 JS 在 iframe onLoad 后直接操作其 contentDocument 完成，彻底绕开 CSP 限制。
+
+  // 章节内容变化时重置 iframe 基线：避免 marks 效果在 iframe 重新加载前，
+  // 把上一章的"干净内容"误写回正在切换的新文档。真正的内容捕获/应用由 onLoad 负责。
+  useEffect(() => {
+    iframeCleanHtmlRef.current = '';
+    iframeLoadedRef.current = false;
+  }, [chapterContent]);
+
+  // 设置变化：仅更新样式（不重建 innerHTML，保留滚动位置）
+  useEffect(() => {
+    const f = iframeRef.current;
+    const doc = f && f.contentDocument;
+    if (!doc || !doc.body) return;
+    iframeApplySettings(doc, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme });
+  }, [settings.fontSize, settings.lineHeight, settings.theme]);
 
   // 滚动位置保存（防抖，500ms）
   // PDF 模式下不处理滚动（PDF 用翻页而非滚动）
   const handleScroll = useCallback(() => {
+    // iframe 渲染模式：滚动发生在 iframe 内部
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      const f = iframeRef.current;
+      if (!f || !f.contentWindow) return;
+      const el = f.contentWindow.document.scrollingElement || f.contentWindow.document.body;
+      const scrollPercent = el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
+      scrollPosRef.current = Math.round(scrollPercent * 100);
+      if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = setTimeout(() => {
+        onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
+      }, 500);
+      return;
+    }
     if (!contentRef.current || book.format === 'pdf') return;
     // 如果正在恢复滚动位置，跳过保存
     if (scrollRestoredRef.current) return;
@@ -741,7 +801,7 @@ export function Reader({
     scrollSaveTimerRef.current = setTimeout(() => {
       onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
     }, 500);
-  }, [book.id, book.format, onUpdateProgress]);
+  }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
 
   // 恢复滚动位置（只在 EPUB/TXT 模式下，且只执行一次）
@@ -1264,6 +1324,90 @@ export function Reader({
     [highlights, currentChapter]
   );
 
+  // 标记/高亮变化：重建内容并重新应用（保留滚动位置）。
+  // 放在 currentChapterHighlights 声明之后，避免 const 前向引用（TS2448/2454）与运行时 TDZ。
+  useEffect(() => {
+    const f = iframeRef.current;
+    const doc = f && f.contentDocument;
+    if (!doc || !doc.body || !iframeLoadedRef.current) return;
+    const prevY = doc.scrollingElement ? (doc.scrollingElement as HTMLElement).scrollTop : 0;
+    iframeApplyAll(doc, iframeCleanHtmlRef.current, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })));
+    try { if (doc.scrollingElement) (doc.scrollingElement as HTMLElement).scrollTop = prevY; } catch (err) { /* ignore */ }
+  }, [markedWords, currentChapterHighlights]);
+
+  // ===== EPUB iframe 交互（父窗口直接操作 iframe.contentDocument，绕开 CSP 内联限制）=====
+  // 用 ref 持有最新的 handleWordClick，避免 iframe 内绑定事件后闭包过期读到旧的 book.language / hasAiKey。
+  const handleWordClickRef = useRef(handleWordClick);
+  handleWordClickRef.current = handleWordClick;
+
+  // iframe 内"单击"：优先命中高亮（弹笔记），否则按坐标取词查词。
+  // 注：在 iframe 文档上监听，事件 target/clientX 都属于 iframe 坐标系，与父窗口无关。
+  const onIframeClick = useCallback((e: Event) => {
+    const f = iframeRef.current;
+    const doc = f && f.contentDocument;
+    if (!doc || !doc.body) return;
+    // 与父窗口一致：mouseup 刚选过文本时，click 直接跳过取词（避免选区被当成单词）
+    if (justSelectedRef.current) { justSelectedRef.current = false; return; }
+    const target = e.target as HTMLElement | null;
+    const highlightEl = target && target.closest ? (target.closest('[data-highlight-id]') as HTMLElement | null) : null;
+    if (highlightEl) {
+      const hlId = highlightEl.getAttribute('data-highlight-id');
+      if (hlId) {
+        const hl = highlightsRef.current.find(h => h.id === hlId);
+        if (hl) {
+          setActiveHighlight(hl);
+          setNoteDraft(hl.note || '');
+          setSidebarMode('highlightNote');
+          setShowSidebar(true);
+          return;
+        }
+      }
+    }
+    const me = e as MouseEvent;
+    const info = iframeGetWordInfo(doc, me.clientX, me.clientY);
+    if (info && info.word && info.word.length >= 2) {
+      handleWordClickRef.current(info.word, info.sentence || undefined);
+    }
+  }, []);
+
+  // iframe 内"选词"：用户框选文本后弹出操作面板（解析/下划线/笔记）。
+  const onIframeMouseup = useCallback(() => {
+    const f = iframeRef.current;
+    const doc = f && f.contentDocument;
+    if (!doc) return;
+    const sel = doc.getSelection ? doc.getSelection() : null;
+    if (sel && !sel.isCollapsed) {
+      const text = sel.toString().trim();
+      if (text.length >= 2) {
+        setSelectedText(text);
+        setSidebarMode('selection');
+        setShowSidebar(true);
+        sel.removeAllRanges();
+        justSelectedRef.current = true;
+      }
+    }
+  }, []);
+
+  // iframe 加载完成：捕获干净内容基线 + 应用设置/标记/高亮/脚注 + 绑定交互事件。
+  // 这是方案 B 的核心——全部由父窗口（打包 JS）在 onLoad 后操作 contentDocument，
+  // 不再依赖被 CSP 拦截的 iframe 内联 <script>。
+  const handleIframeLoad = useCallback(() => {
+    const f = iframeRef.current;
+    const doc = f && f.contentDocument;
+    if (!doc || !doc.body) return;
+    // 捕获干净内容基线（每次 load 都是全新文档，body 即未注入任何标记/高亮的原始渲染）
+    iframeCleanHtmlRef.current = doc.body.innerHTML;
+    iframeLoadedRef.current = true;
+    iframeApplyAll(doc, iframeCleanHtmlRef.current, {
+      fontSize: settings.fontSize,
+      lineHeight: settings.lineHeight,
+      theme: settings.theme,
+    }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })));
+    // 绑定交互事件（在 iframe 文档上，绕开 CSP 内联脚本限制）
+    doc.body.addEventListener('click', onIframeClick as EventListener);
+    doc.body.addEventListener('mouseup', onIframeMouseup as EventListener);
+  }, [settings.fontSize, settings.lineHeight, settings.theme, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup]);
+
   // 渲染内容区域 — 普通函数，不需要 useCallback（每次渲染直接调用）
   const renderContent = () => {
     if (book.format === 'pdf') {
@@ -1307,6 +1451,39 @@ export function Reader({
         {bookCss ? <style>{scopeCss(bookCss, '.reader-html-content')}</style> : null}
         {parseHtmlToReact(chapterContent, markedWords, currentChapterHighlights)}
       </div>
+    );
+  };
+
+  // EPUB iframe 模式：把整章（图片已内联 base64 + 书籍完整 CSS 原样）塞进隔离 iframe，
+  // 原书排版 100% 保留。查词/划词/高亮/脚注**不**走 iframe 内脚本——Tauri CSP 的
+  // script-src 没有 'unsafe-inline'，内联脚本会被拦截（这正是 f144b45 那版"打不开"的根因）。
+  // 方案 B：srcDoc 只注入样式与正文，所有交互由父窗口在 iframe onLoad 后直接操作其
+  // contentDocument 完成（设置变化经父窗口 effect 直接改样式，避免重建 iframe 丢滚动）。
+  const epubSrcDoc = useMemo(() => {
+    if (book.format !== 'epub' || epubRenderMode !== 'iframe' || !chapterContent) return '';
+    return buildSrcDoc(chapterContent, bookCss, {
+      fontSize: settings.fontSize,
+      lineHeight: settings.lineHeight,
+      theme: settings.theme,
+    });
+  }, [book.format, epubRenderMode, chapterContent, bookCss]);
+
+  const renderIframeContent = () => {
+    if (!chapterContent) {
+      return (
+        <div className="text-center py-20">
+          <p className="opacity-60">本章内容为空</p>
+        </div>
+      );
+    }
+    return (
+      <iframe
+        ref={iframeRef}
+        srcDoc={epubSrcDoc}
+        title="book-content"
+        onLoad={handleIframeLoad}
+        className="w-full h-full border-0 bg-transparent"
+      />
     );
   };
 
@@ -1686,32 +1863,18 @@ export function Reader({
           ref={contentRef}
           onScroll={book.format === 'pdf' ? undefined : handleScroll}
           className={`flex-1 h-[calc(100vh-64px)] ${
-            book.format === 'pdf' ? 'overflow-hidden' : 'overflow-y-auto'
+            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe'))
+              ? 'overflow-hidden'
+              : 'overflow-y-auto'
           } ${showSidebar && book.format !== 'pdf' ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
         >
-          <div
-            className={book.format === 'pdf' ? '' : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
-            style={book.format === 'pdf' ? undefined : {
-              fontSize: settings.fontSize,
-              lineHeight: settings.lineHeight,
-              fontFamily: settings.fontFamily
-            }}
-          >
-            {/* Chapter Title (EPUB/TXT only) */}
-            {book.format !== 'pdf' && flatChapters[currentChapter] && (
-              <h1 className="text-3xl font-bold mb-8 text-center">
-                {flatChapters[currentChapter].title}
-              </h1>
-            )}
-            
-            {/* Content */}
-            <div className="prose prose-lg max-w-none">
-              {renderContent()}
-            </div>
-
-            {/* Chapter Navigation Footer (EPUB/TXT only) */}
-            {book.format !== 'pdf' && (
-              <div className="flex items-center justify-between mt-16 pt-8 border-t border-current/10">
+          {book.format === 'epub' && epubRenderMode === 'iframe' ? (
+            <div className="flex flex-col h-full">
+              <div className="flex-1 min-h-0">
+                {renderIframeContent()}
+              </div>
+              {/* Chapter Navigation Footer */}
+              <div className="flex items-center justify-between px-6 py-4 border-t border-current/10">
                 <Button
                   variant="ghost"
                   onClick={() => changeChapter(currentChapter - 1)}
@@ -1721,11 +1884,9 @@ export function Reader({
                   <ChevronLeft className="w-4 h-4" />
                   上一章
                 </Button>
-                
                 <span className="text-sm text-white/60">
                   {currentChapter + 1} / {flatChapters.length}
                 </span>
-
                 <Button
                   variant="ghost"
                   onClick={() => changeChapter(currentChapter + 1)}
@@ -1736,8 +1897,58 @@ export function Reader({
                   <ChevronRight className="w-4 h-4" />
                 </Button>
               </div>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div
+              className={book.format === 'pdf' ? '' : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
+              style={book.format === 'pdf' ? undefined : {
+                fontSize: settings.fontSize,
+                lineHeight: settings.lineHeight,
+                fontFamily: settings.fontFamily
+              }}
+            >
+              {/* Chapter Title (EPUB/TXT only) */}
+              {book.format !== 'pdf' && flatChapters[currentChapter] && (
+                <h1 className="text-3xl font-bold mb-8 text-center">
+                  {flatChapters[currentChapter].title}
+                </h1>
+              )}
+
+              {/* Content */}
+              <div className="prose prose-lg max-w-none">
+                {renderContent()}
+              </div>
+
+              {/* Chapter Navigation Footer (EPUB/TXT only) */}
+              {book.format !== 'pdf' && (
+                <div className="flex items-center justify-between mt-16 pt-8 border-t border-current/10">
+                  <Button
+                    variant="ghost"
+                    onClick={() => changeChapter(currentChapter - 1)}
+                    disabled={currentChapter === 0}
+                    className="flex items-center gap-2 bg-current/5 border border-current/15 opacity-90 hover:bg-current/10 hover:opacity-100 disabled:opacity-30"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    上一章
+                  </Button>
+                  
+                  <span className="text-sm text-white/60">
+                    {currentChapter + 1} / {flatChapters.length}
+                  </span>
+
+                  <Button
+                    variant="ghost"
+                    onClick={() => changeChapter(currentChapter + 1)}
+                    disabled={currentChapter >= flatChapters.length - 1}
+                    className="flex items-center gap-2 bg-current/5 border border-current/15 opacity-90 hover:bg-current/10 hover:opacity-100 disabled:opacity-30"
+                  >
+                    下一章
+                    <ChevronRight className="w-4 h-4" />
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
         </main>
 
         {/* Sidebar */}
@@ -2122,6 +2333,250 @@ function splitSelectors(prelude: string): string[] {
   }
   if (current.trim()) parts.push(current);
   return parts;
+}
+
+// ============ EPUB iframe 渲染（参考 koodo-reader：iframe + 原书完整 CSS 原样渲染，最大化保留原书格式） ============
+// 关键思路：把整章（图片已内联 base64、书籍全部 CSS 原样）塞进一个隔离的 iframe，
+// 不再经过 scopeCss 字符串重写、也不经 React 重建 DOM——因此角标/引用/首字下沉/表格/图文混排等
+// 原书排版 100% 保留。查词/划词/高亮/脚注**不**走 iframe 内脚本（会被 Tauri CSP 拦截），
+// 而由父窗口在 iframe onLoad 后直接操作其 contentDocument 完成（见下方 iframeApplySettings 等）。
+
+// 阅读器基础排版（注入 iframe head，作用在隔离文档内，无需 scope 前缀）
+const READER_BASE_CSS = `
+* { box-sizing: border-box; }
+html { font-size: 18px; }
+body { margin: 0; padding: 0; }
+.reader-html-content {
+  font-size: var(--reader-font, 18px);
+  line-height: var(--reader-line, 1.6);
+  padding: 2rem 2.2rem 4rem;
+  max-width: 44rem;
+  margin: 0 auto;
+  font-family: 'Bricolage Grotesque', Georgia, 'Times New Roman', serif;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.reader-theme-light { background: #f5f2e9; color: #2c2c2c; }
+.reader-theme-dark { background: #1a1c1f; color: #e0e0e0; }
+.reader-theme-sepia { background: #f4ecd8; color: #5b4636; }
+.reader-html-content p { margin: 0 0 1.25em; text-align: justify; }
+.reader-html-content h1, .reader-html-content h2, .reader-html-content h3,
+.reader-html-content h4, .reader-html-content h5, .reader-html-content h6 {
+  margin: 1.5em 0 0.75em; font-weight: 700; line-height: 1.3;
+}
+.reader-html-content h1 { font-size: 1.8em; }
+.reader-html-content h2 { font-size: 1.5em; }
+.reader-html-content h3 { font-size: 1.3em; }
+.reader-html-content h4 { font-size: 1.15em; }
+.reader-html-content img { max-width: 100%; height: auto; display: block; margin: 1.5em auto; border-radius: 8px; }
+.reader-html-content figure { margin: 1.5em 0; text-align: center; }
+.reader-html-content figcaption { font-size: 0.85em; opacity: 0.7; margin-top: 0.5em; }
+.reader-html-content blockquote { margin: 1.5em 0; padding-left: 1.5em; border-left: 3px solid currentColor; opacity: 0.85; font-style: italic; }
+.reader-html-content pre { margin: 1.5em 0; padding: 1em; border-radius: 8px; overflow-x: auto; font-size: 0.9em; line-height: 1.5; background: rgba(128,128,128,0.1); }
+.reader-html-content code { font-size: 0.9em; padding: 0.1em 0.3em; border-radius: 3px; background: rgba(128,128,128,0.15); }
+.reader-html-content ul, .reader-html-content ol { margin: 1em 0; padding-left: 2em; }
+.reader-html-content li { margin-bottom: 0.5em; }
+.reader-html-content table { width: 100%; border-collapse: collapse; margin: 1.5em 0; }
+.reader-html-content th, .reader-html-content td { padding: 0.5em 0.75em; border: 1px solid rgba(128,128,128,0.3); text-align: left; }
+.reader-html-content th { font-weight: 600; background: rgba(128,128,128,0.1); }
+.reader-html-content hr { margin: 2em 0; border: none; border-top: 1px solid rgba(128,128,128,0.3); }
+.reader-html-content a { color: #e5a349; text-decoration: underline; cursor: pointer; }
+.reader-html-content a:hover { opacity: 0.8; }
+.reader-html-content sup, .reader-html-content sub { font-size: 0.65em !important; line-height: 0 !important; }
+.reader-html-content sup { vertical-align: super !important; }
+.reader-html-content sub { vertical-align: sub !important; }
+
+/* 兜底：常见 EPUB 脚注/尾注/引用角标，即使书籍 CSS 把它们 reset 成正文也要保持上标小字号 */
+.reader-html-content a[epub\:type~="noteref"],
+.reader-html-content a[epub\:type~="noteback"],
+.reader-html-content a[epub\:type~="referrer"],
+.reader-html-content .noteref,
+.reader-html-content .noteRef,
+.reader-html-content .noteback,
+.reader-html-content .footnote-ref,
+.reader-html-content .endnote-ref,
+.reader-html-content .note-ref,
+.reader-html-content .fn,
+.reader-html-content .fnref,
+.reader-html-content .fn-ref,
+.reader-html-content .pgk-fn,
+.reader-html-content .reference,
+.reader-html-content .ref,
+.reader-html-content .cite,
+.reader-html-content .en,
+.reader-html-content .calibre_4,
+.reader-html-content .calibre_5,
+.reader-html-content .calibre_6,
+.reader-html-content .reader-force-sup,
+.reader-html-content .reader-force-sup * {
+  vertical-align: super !important;
+  font-size: 0.65em !important;
+  line-height: 0 !important;
+}
+.reader-html-content center { text-align: center; }
+.reader-html-content .epub-image, .reader-html-content .illustration { max-width: 100%; height: auto; margin: 1.5em auto; display: block; }
+.reader-html-content mark, .reader-html-content .vocab-mark {
+  background: rgba(229,163,73,0.3) !important;
+  border-bottom: 2px solid #e5a349 !important;
+  padding: 0 2px !important;
+  border-radius: 2px !important;
+  cursor: pointer !important;
+  color: inherit !important;
+}
+.reader-html-content .user-highlight {
+  background: rgba(99,179,237,0.28) !important;
+  border-bottom: 2px solid #63b3ed !important;
+  cursor: pointer !important;
+  color: inherit !important;
+}
+.reader-theme-dark .reader-html-content a { color: #e5a349; }
+.reader-theme-sepia .reader-html-content a { color: #8b6914; }
+.reader-theme-light .reader-html-content a { color: #c47a1a; }
+`;
+
+// ============ EPUB iframe 渲染：父窗口直接操作 iframe.contentDocument ============
+// 说明：Tauri CSP 的 script-src 没有 'unsafe-inline'，iframe srcDoc 内的内联 <script>
+// 会被拦截而不执行，导致之前"查词/高亮/脚注识别全部失效、书打不开"。方案 B：把交互
+// 逻辑从内联脚本改为父窗口（打包 JS，来源 'self'，不受内联限制）在 iframe onLoad 后
+// 直接操作其 contentDocument，注入样式、绑定事件、应用高亮/标记/脚注，彻底绕开 CSP。
+
+type IframeSettings = { fontSize: number; lineHeight: number; theme: string };
+type IframeHighlight = { id: string; text: string; note?: string };
+
+function iframeApplySettings(doc: Document, s: IframeSettings) {
+  doc.documentElement.style.setProperty('--reader-font', s.fontSize + 'px');
+  doc.documentElement.style.setProperty('--reader-line', String(s.lineHeight));
+  doc.body.className = 'reader-html-content reader-theme-' + s.theme;
+}
+function iframeCleanWord(w: string, isPhrase: boolean): string {
+  if (isPhrase) return w.trim().replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
+  return w.replace(/[\p{P}\p{S}]/gu, '');
+}
+function iframeGetSentence(block: HTMLElement, raw: string): string {
+  const full = block ? (block.textContent || '') : '';
+  const idx = full.toLowerCase().indexOf(raw.toLowerCase());
+  if (idx < 0) return '';
+  let s = idx; while (s > 0 && !/[.!?。！？\n]/.test(full[s - 1])) s--;
+  let e = idx + raw.length; while (e < full.length && !/[.!?。！？\n]/.test(full[e])) e++;
+  return full.slice(s, e).trim();
+}
+function iframeGetWordInfo(doc: Document, x: number, y: number): { word: string; sentence: string } | null {
+  let range: any = null;
+  const anyDoc = doc as any;
+  if (anyDoc.caretRangeFromPoint) range = anyDoc.caretRangeFromPoint(x, y);
+  else if (anyDoc.caretPositionFromPoint) { const cp = anyDoc.caretPositionFromPoint(x, y); if (cp) { range = doc.createRange(); range.setStart(cp.offsetNode, cp.offset); range.collapse(true); } }
+  if (!range) return null;
+  const node: any = range.startContainer;
+  if (node.nodeType !== 3) {
+    const el = node.nodeType === 1 ? node : node.parentNode;
+    const txt = el && el.textContent ? el.textContent.trim() : '';
+    if (txt) { const w = iframeCleanWord(txt, txt.indexOf(' ') > 0); if (w.length >= 2) return { word: w, sentence: iframeGetSentence(el as HTMLElement, txt) }; }
+    return null;
+  }
+  const text = node.nodeValue; const off = range.startOffset;
+  let st = off, en = off;
+  while (st > 0 && /[\p{L}\p{M}\p{Pd}’']/u.test(text[st - 1])) st--;
+  while (en < text.length && /[\p{L}\p{M}\p{Pd}’']/u.test(text[en])) en++;
+  const raw = text.slice(st, en); if (!raw) return null;
+  const word = iframeCleanWord(raw, raw.indexOf(' ') > 0); if (word.length < 2) return null;
+  return { word, sentence: iframeGetSentence(node.parentNode as HTMLElement, raw) };
+}
+function iframeMarkFootnoteRefs(doc: Document) {
+  const as = doc.querySelectorAll('a');
+  const reNote = /noteref|noteback|referrer|note-ref|footnote|endnote|\bfn\b/;
+  for (let i = 0; i < as.length; i++) {
+    const a = as[i] as HTMLElement;
+    if (a.classList.contains('reader-force-sup')) continue;
+    const href = (a.getAttribute('href') || '').toLowerCase();
+    const epubType = (a.getAttribute('epub:type') || '').toLowerCase();
+    const id = (a.getAttribute('id') || '').toLowerCase();
+    const cls = (' ' + (a.className || '') + ' ').toLowerCase();
+    const txt = (a.textContent || '').trim();
+    const isNoteRef = reNote.test(epubType + ' ' + href + ' ' + id + ' ' + cls);
+    const looksLikeNumber = /^[\[\(]?\d+[\]\)]?$/.test(txt);
+    if (isNoteRef || (looksLikeNumber && /#/.test(href) && /note|fn|back/.test(href))) {
+      a.classList.add('reader-force-sup');
+    }
+  }
+}
+function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
+  if (!wordsSet || !wordsSet.size) return;
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(n: any) {
+      if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const nodes: any[] = []; let n: any; while (n = walker.nextNode()) nodes.push(n);
+  for (const node of nodes) {
+    const text = node.nodeValue;
+    const parts = text.split(/([^\p{L}\p{M}\u2010-\u2015']+)/gu);
+    const frag = doc.createDocumentFragment(); let changed = false;
+    for (const part of parts) {
+      if (!part) continue;
+      if (/[\p{L}\p{M}]/u.test(part)) {
+        const clean = part.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
+        if (clean && wordsSet.has(clean) && clean.length >= 2) {
+          const m = doc.createElement('mark'); m.className = 'vocab-mark'; m.textContent = part; frag.appendChild(m); changed = true; continue;
+        }
+      }
+      frag.appendChild(doc.createTextNode(part));
+    }
+    if (changed) node.parentNode.replaceChild(frag, node);
+  }
+}
+function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
+  if (!list || !list.length) return;
+  const items = list.slice().sort((a, b) => b.text.length - a.text.length);
+  for (const it of items) {
+    if (!it.text) continue;
+    const t = it.text;
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(n: any) {
+        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE' || (p.closest && p.closest('[data-highlight-id]')))) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes: any[] = []; let nd: any; while (nd = walker.nextNode()) nodes.push(nd);
+    for (const node of nodes) {
+      const text = node.nodeValue; let from = 0; const frag = doc.createDocumentFragment();
+      while (true) {
+        const idx = text.indexOf(t, from); if (idx < 0) { frag.appendChild(doc.createTextNode(text.slice(from))); break; }
+        if (idx > from) frag.appendChild(doc.createTextNode(text.slice(from, idx)));
+        const span = doc.createElement('span'); span.setAttribute('data-highlight-id', it.id); span.className = 'user-highlight'; span.textContent = text.slice(idx, idx + t.length); frag.appendChild(span); from = idx + t.length;
+      }
+      node.parentNode.replaceChild(frag, node);
+    }
+  }
+}
+function iframeApplyAll(doc: Document, cleanHtml: string, s: IframeSettings, wordsSet: Set<string>, list: IframeHighlight[]) {
+  doc.body.innerHTML = cleanHtml;
+  iframeApplySettings(doc, s);
+  iframeApplyMarks(doc, wordsSet);
+  iframeApplyHighlights(doc, list);
+  iframeMarkFootnoteRefs(doc);
+}
+
+function buildSrcDoc(
+  content: string,
+  bookCss: string,
+  settings: { fontSize: number; lineHeight: number; theme: string },
+): string {
+  const themeClass = `reader-theme-${settings.theme}`;
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${bookCss || ''}</style>
+<style>${READER_BASE_CSS}</style>
+</head>
+<body class="reader-html-content ${themeClass}">
+${content}
+</body>
+</html>`;
 }
 
 function parseHtmlToReact(
