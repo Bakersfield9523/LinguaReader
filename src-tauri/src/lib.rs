@@ -1,10 +1,52 @@
-use std::process::{Command, Child};
+use std::process::{Command, Child, Stdio};
 use std::sync::Mutex;
+use std::net::{TcpListener, Ipv4Addr};
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 use serde::Serialize;
 use tauri::Manager;
+use tauri::State;
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 static BACKEND: Mutex<Option<Child>> = Mutex::new(None);
+
+// 后端实际监听端口：Rust 在启动时探测空闲端口后写入，前端通过 get_backend_port 读取。
+// 这样即使 3000 被常驻软件占用，也能自动换端口，避免 "Failed to fetch"。
+struct BackendState {
+    port: Mutex<u16>,
+}
+
+/// 从 start 起探测一个未被占用的 TCP 端口（node 端也做兜底重试）
+fn find_free_port(start: u16) -> u16 {
+    for port in start..(start + 200) {
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    start
+}
+
+/// 前端读取后端实际端口，避免端口冲突导致无法连接
+#[tauri::command]
+fn get_backend_port(state: State<BackendState>) -> u16 {
+    *state.port.lock().unwrap()
+}
+
+/// 打开日志文件句柄（把 node 后端 stdout/stderr 落盘，便于排查启动失败）
+fn log_stdio(log_path: &Option<PathBuf>) -> Stdio {
+    match log_path {
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match OpenOptions::new().create(true).append(true).open(p) {
+                Ok(f) => Stdio::from(f),
+                Err(_) => Stdio::null(),
+            }
+        }
+        None => Stdio::null(),
+    }
+}
 
 // ============ AI API 命令（从 Rust 进程发请求，绕过 WebView CORS） ============
 
@@ -170,8 +212,10 @@ async fn ai_chat(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let backend_state = BackendState { port: Mutex::new(3000) };
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ai_test_key, ai_chat])
+        .manage(backend_state)
+        .invoke_handler(tauri::generate_handler![ai_test_key, ai_chat, get_backend_port])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -197,11 +241,15 @@ pub fn run() {
                 )?;
             }
 
-            // Start Node.js backend
-            let child = start_backend(app.handle());
+            // Start Node.js backend on a dynamically chosen free port
+            let port = find_free_port(3000);
+            *app.state::<BackendState>().port.lock().unwrap() = port;
+            let child = start_backend(app.handle(), port);
             if let Some(child) = child {
-                log::info!("Backend started with PID: {}", child.id());
+                log::info!("Backend started with PID: {} on port {}", child.id(), port);
                 BACKEND.lock().unwrap().replace(child);
+            } else {
+                log::error!("Backend failed to start (node not found or spawn error)");
             }
 
             Ok(())
@@ -217,7 +265,7 @@ pub fn run() {
             .expect("error while running tauri application");
 }
 
-fn start_backend(handle: &tauri::AppHandle) -> Option<Child> {
+fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
     // 优先使用 Tauri 资源目录中的 boot.js（生产安装包）
     let resource_dir = handle.path().resource_dir().ok()?;
     let candidates = vec![
@@ -226,14 +274,24 @@ fn start_backend(handle: &tauri::AppHandle) -> Option<Child> {
         std::path::PathBuf::from("app/dist/boot.js"),
     ];
 
+    // 日志路径：应用数据目录下的 backend.log（便于排查启动失败）
+    let log_path: Option<PathBuf> = handle
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("backend.log"));
+
     for backend_script in &candidates {
         if backend_script.exists() {
-            log::info!("Starting backend: {:?}", backend_script);
+            log::info!("Starting backend: {:?} on port {}", backend_script, port);
             let work_dir = backend_script.parent().map(|p| p.to_path_buf()).unwrap_or(resource_dir.clone());
             match Command::new("node")
                 .arg(backend_script)
                 .current_dir(work_dir)
                 .env("NODE_ENV", "production")
+                .env("PORT", port.to_string())
+                .stdout(log_stdio(&log_path))
+                .stderr(log_stdio(&log_path))
                 .spawn()
             {
                 Ok(child) => return Some(child),

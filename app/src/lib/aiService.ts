@@ -4,6 +4,7 @@
 import { SettingsDB } from './db';
 import { LANGUAGE_NAMES } from '@/types';
 import type { Language } from '@/types';
+import { getBackendPort } from './backend';
 
 // ============ 类型定义 ============
 
@@ -85,8 +86,10 @@ const isTauri = typeof window !== 'undefined'
   && (!!(window as any).__TAURI_INTERNALS__ || !!(window as any).__TAURI__);
 const isDev = import.meta.env.DEV;
 
-// 浏览器开发模式用相对路径（同源），生产模式用 localhost:3000
-const AI_PROXY_BASE = isDev ? '' : 'http://localhost:3000';
+// 浏览器开发模式用相对路径（同源），生产模式用 localhost + 动态端口（由 Rust 分配，避免 3000 冲突）
+function aiProxyBase(): string {
+  return isDev ? '' : `http://localhost:${getBackendPort()}`;
+}
 
 // ============ Tauri invoke 封装 ============
 
@@ -185,7 +188,7 @@ async function callAICompletion(
     return result.content || '';
   } else {
     // 浏览器环境：通过后端代理
-    const response = await fetchWithTimeout(`${AI_PROXY_BASE}/api/ai/chat`, {
+    const response = await fetchWithTimeout(`${aiProxyBase()}/api/ai/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -350,7 +353,7 @@ export async function testApiKey(provider: AIProvider, apiKey: string): Promise<
     }
   } else {
     // 浏览器环境：通过后端代理
-    const url = `${AI_PROXY_BASE}/api/ai/test`;
+    const url = `${aiProxyBase()}/api/ai/test`;
     console.log(`[AI] testApiKey (proxy): ${url}`);
     try {
       const response = await fetchWithTimeout(url, {

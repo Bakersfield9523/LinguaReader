@@ -19,6 +19,16 @@ const LOCK_CODES = new Set([
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function robustCopy(src, dst, retries = 30) {
+  try {
+    const st = fs.lstatSync(src);
+    if (st.isFile() && fs.existsSync(dst)) {
+      // 已存在且大小一致则跳过：避免重复覆盖触发杀毒重新加锁
+      const dstsz = fs.statSync(dst).size;
+      if (dstsz === st.size && dstsz > 0) return;
+    }
+  } catch {
+    /* dst 不存在或无法读取，继续复制 */
+  }
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const st = fs.lstatSync(src);
@@ -135,6 +145,28 @@ console.log('[postbuild] Copied @libsql/client closure');
 // 硬性校验关键原生二进制已就位（Defender 锁可能导致复制被跳过）
 await ensureNativeBinary('better-sqlite3/build/Release/better_sqlite3.node');
 await ensureNativeBinary('@libsql/win32-x64-msvc/index.node');
+
+/**
+ * Windows 实时杀毒在原生二进制写入后会短暂独占锁定（os error 32），
+ * 若紧随其后的 cargo/tauri 资源扫描读取该文件会直接失败。这里轮询读取，
+ * 主动触发并等待杀毒扫描释放锁，确保 build 脚本接手时文件可读。
+ */
+async function waitUnlocked(relPath) {
+  const p = path.join('dist', 'node_modules', relPath);
+  for (let i = 0; i < 40; i++) {
+    try {
+      fs.readFileSync(p);
+      return;
+    } catch {
+      await sleep(500);
+    }
+  }
+  console.warn(`[postbuild] WARN: ${relPath} 仍被锁定（忽略，继续构建）`);
+}
+
+await waitUnlocked('better-sqlite3/build/Release/better_sqlite3.node');
+await waitUnlocked('@libsql/win32-x64-msvc/index.node');
+console.log('[postbuild] 原生二进制锁定已释放，可安全进入 cargo 构建');
 
 // Create minimal package.json so Node.js treats dist/ as a package root.
 // 必须声明 "type": "module"，因为 boot.js 使用 import.meta.dirname 等 ESM 专属语法，
