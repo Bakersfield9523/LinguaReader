@@ -13,6 +13,8 @@ export const users = sqliteTable("users", {
   name: text("name").notNull().default(""),
   avatar: text("avatar"), // base64 encoded avatar image
   passwordHash: text("password_hash").notNull(),
+  securityQuestion: text("security_question"), // 找回密码用的安全问题
+  securityAnswer: text("security_answer"), // 安全答案的哈希（pbkdf2）
   createdAt: text("created_at").notNull().default(sql`(CURRENT_TIMESTAMP)`),
   updatedAt: text("updated_at").notNull().default(sql`(CURRENT_TIMESTAMP)`),
 });

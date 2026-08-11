@@ -4,7 +4,7 @@ import { createRouter, authRateLimited, authedQuery } from "./middleware";
 import { getDb } from "./queries/connection";
 import { users } from "@db/schema";
 import { eq, or } from "drizzle-orm";
-import { createToken } from "./context";
+import { createToken, createResetToken, verifyResetToken } from "./context";
 import { TRPCError } from "@trpc/server";
 
 // 简单密码哈希（使用 crypto，无需 argon2）
@@ -35,9 +35,16 @@ export const authRouter = createRouter({
         email: z.string().email().optional(),
         phone: z.string().min(5).max(20).optional(),
         password: z.string().min(6).max(100),
+        securityQuestion: z.string().max(200).optional(),
+        securityAnswer: z.string().max(200).optional(),
       }).refine((data) => data.email || data.phone, {
         message: "请提供邮箱或手机号",
-      }),
+      }).refine(
+        (data) =>
+          (data.securityQuestion && data.securityAnswer) ||
+          (!data.securityQuestion && !data.securityAnswer),
+        { message: "安全问题和答案需同时提供" },
+      ),
     )
     .mutation(async ({ input }) => {
       const db = getDb();
@@ -65,11 +72,16 @@ export const authRouter = createRouter({
       }
 
       const passwordHash = hashPassword(input.password);
+      const securityAnswerHash = input.securityAnswer
+        ? hashPassword(input.securityAnswer)
+        : null;
       const result = await db.insert(users).values({
         name: input.name,
         email: input.email || null,
         phone: input.phone || null,
         passwordHash,
+        securityQuestion: input.securityQuestion || null,
+        securityAnswer: securityAnswerHash,
       });
 
       const userId = Number(result.lastInsertRowid);
@@ -206,6 +218,79 @@ export const authRouter = createRouter({
         .update(users)
         .set({ passwordHash: newHash, updatedAt: new Date().toISOString() })
         .where(eq(users.id, ctx.user.id));
+
+      return { success: true };
+    }),
+
+  // ── 找回密码：第一步，按手机号/邮箱查找账户并取回安全问题 ──
+  forgotPasswordLookup: authRateLimited
+    .input(z.object({ account: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      const db = getDb();
+      const found = await db
+        .select({ id: users.id, securityQuestion: users.securityQuestion })
+        .from(users)
+        .where(or(eq(users.phone, input.account), eq(users.email, input.account)))
+        .limit(1);
+
+      if (found.length === 0) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "未找到使用该手机号或邮箱的账号" });
+      }
+      const user = found[0];
+      if (!user.securityQuestion || !user.securityQuestion.trim()) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "该账号未设置安全问题，无法使用此方式找回，请改用其他方式或联系支持",
+        });
+      }
+      return { securityQuestion: user.securityQuestion };
+    }),
+
+  // ── 找回密码：第二步，校验安全问题答案，通过则发短时效重置令牌 ──
+  verifySecurityAnswer: authRateLimited
+    .input(z.object({ account: z.string().min(1), answer: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      const db = getDb();
+      const found = await db
+        .select({ id: users.id, securityAnswer: users.securityAnswer })
+        .from(users)
+        .where(or(eq(users.phone, input.account), eq(users.email, input.account)))
+        .limit(1);
+
+      if (found.length === 0) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "未找到使用该手机号或邮箱的账号" });
+      }
+      const user = found[0];
+      if (!user.securityAnswer) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "该账号未设置安全问题" });
+      }
+      const valid = verifyPassword(input.answer, user.securityAnswer);
+      if (!valid) {
+        throw new TRPCError({ code: "UNAUTHORIZED", message: "安全问题答案错误" });
+      }
+      const resetToken = await createResetToken(user.id);
+      return { resetToken };
+    }),
+
+  // ── 找回密码：第三步，用重置令牌设置新密码 ──
+  resetPassword: authRateLimited
+    .input(
+      z.object({
+        resetToken: z.string().min(1),
+        newPassword: z.string().min(6).max(100),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      const payload = await verifyResetToken(input.resetToken);
+      if (!payload) {
+        throw new TRPCError({ code: "UNAUTHORIZED", message: "重置链接无效或已过期，请重新发起找回" });
+      }
+      const db = getDb();
+      const newHash = hashPassword(input.newPassword);
+      await db
+        .update(users)
+        .set({ passwordHash: newHash, updatedAt: new Date().toISOString() })
+        .where(eq(users.id, payload.userId));
 
       return { success: true };
     }),

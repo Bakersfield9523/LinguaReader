@@ -25,6 +25,25 @@ export async function verifyToken(token: string) {
   }
 }
 
+// 找回密码用的短时效令牌（10 分钟），与普通登录令牌用途分离
+export async function createResetToken(userId: number) {
+  return new SignJWT({ userId, purpose: "reset" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime("10m")
+    .setIssuedAt()
+    .sign(JWT_SECRET);
+}
+
+export async function verifyResetToken(token: string) {
+  try {
+    const { payload } = await jwtVerify(token, JWT_SECRET, { clockTolerance: 60 });
+    if ((payload as any).purpose !== "reset") return null;
+    return payload as { userId: number; purpose: string };
+  } catch {
+    return null;
+  }
+}
+
 export type TrpcContext = {
   req: Request;
   resHeaders: Headers;

@@ -38,6 +38,10 @@ if (env.isProduction) {
   const { serveStaticFiles } = await import("./lib/vite");
   serveStaticFiles(app);
 
+  // 远程数据库（Turso/libSQL）初始化：在监听端口前确保云端连接与表结构就绪
+  const { initRemoteDb } = await import("./queries/connection");
+  await initRemoteDb();
+
   const port = parseInt(process.env.PORT || "3000");
   serve({ fetch: app.fetch, port }, () => {
     console.log(`Server running on http://localhost:${port}/`);

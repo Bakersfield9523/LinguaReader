@@ -15,37 +15,109 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
   const [nameInput, setNameInput] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // 头像裁剪器状态
+  const [avatarEditorOpen, setAvatarEditorOpen] = useState(false);
+  const [avatarSrc, setAvatarSrc] = useState('');
+  const [avatarZoom, setAvatarZoom] = useState(1);
+  const avatarZoomRef = useRef(1);
+  const avatarPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const avatarImgRef = useRef<HTMLImageElement | null>(null);
+  const avatarCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const avatarDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+
   const fullUpload = trpc.sync.fullUpload.useMutation();
   const fullDownload = trpc.sync.fullDownload.useMutation();
   const [syncing, setSyncing] = useState(false);
   const [downloading, setDownloading] = useState(false);
 
-  // 头像上传
+  // 头像上传：选图后打开裁剪器，不直接上传
   const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = ''; // 允许重复选同一文件
     if (!file) return;
 
     const reader = new FileReader();
     reader.onloadend = () => {
-      const base64 = reader.result as string;
+      const result = reader.result as string;
       const img = new Image();
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const size = Math.min(img.width, img.height, 256);
-        canvas.width = size;
-        canvas.height = size;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const sx = (img.width - size) / 2;
-          const sy = (img.height - size) / 2;
-          ctx.drawImage(img, sx, sy, size, size, 0, 0, size, size);
-          const compressed = canvas.toDataURL('image/jpeg', 0.7);
-          updateProfile({ avatar: compressed });
-        }
+        avatarImgRef.current = img;
+        avatarZoomRef.current = 1;
+        avatarPosRef.current = { x: 0, y: 0 };
+        setAvatarZoom(1);
+        setAvatarPos({ x: 0, y: 0 });
+        setAvatarSrc(result);
+        setAvatarEditorOpen(true);
+        requestAnimationFrame(drawAvatar);
       };
-      img.src = base64;
+      img.src = result;
     };
     reader.readAsDataURL(file);
+  };
+
+  const setAvatarView = (zoom: number, pos: { x: number; y: number }) => {
+    avatarZoomRef.current = zoom;
+    avatarPosRef.current = pos;
+    setAvatarZoom(zoom);
+    setAvatarPos(pos);
+    drawAvatar();
+  };
+
+  const drawAvatar = () => {
+    const canvas = avatarCanvasRef.current;
+    const img = avatarImgRef.current;
+    if (!canvas || !img) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const size = canvas.width;
+    ctx.clearRect(0, 0, size, size);
+    const baseScale = Math.max(size / img.width, size / img.height);
+    const s = baseScale * avatarZoomRef.current;
+    const dw = img.width * s;
+    const dh = img.height * s;
+    const dx = (size - dw) / 2 + avatarPosRef.current.x;
+    const dy = (size - dh) / 2 + avatarPosRef.current.y;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(img, dx, dy, dw, dh);
+    ctx.restore();
+  };
+
+  const onAvatarPointerDown = (e: React.PointerEvent) => {
+    avatarDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: avatarPosRef.current.x,
+      origY: avatarPosRef.current.y,
+    };
+  };
+  const onAvatarPointerMove = (e: React.PointerEvent) => {
+    if (!avatarDragRef.current) return;
+    const dx = e.clientX - avatarDragRef.current.startX;
+    const dy = e.clientY - avatarDragRef.current.startY;
+    setAvatarView(avatarZoomRef.current, {
+      x: avatarDragRef.current.origX + dx,
+      y: avatarDragRef.current.origY + dy,
+    });
+  };
+  const onAvatarPointerUp = () => {
+    avatarDragRef.current = null;
+  };
+
+  const confirmAvatar = () => {
+    const canvas = avatarCanvasRef.current;
+    if (!canvas) return;
+    const out = document.createElement('canvas');
+    out.width = 256;
+    out.height = 256;
+    const octx = out.getContext('2d');
+    if (!octx) return;
+    octx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 256, 256);
+    const compressed = out.toDataURL('image/png');
+    updateProfile({ avatar: compressed });
+    setAvatarEditorOpen(false);
   };
 
   // 修改名字
@@ -374,6 +446,57 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
             </button>
           </div>
         </>
+      )}
+
+      {/* 头像裁剪器 */}
+      {avatarEditorOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60"
+          onClick={() => setAvatarEditorOpen(false)}
+        >
+          <div
+            className="bg-[#282b2f] border border-white/10 rounded-2xl p-5 w-80 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-sm text-white/80 font-medium">调整头像</div>
+            <div
+              className="relative mx-auto w-[220px] h-[220px] rounded-full overflow-hidden bg-black/30 cursor-move touch-none select-none"
+              onPointerDown={onAvatarPointerDown}
+              onPointerMove={onAvatarPointerMove}
+              onPointerUp={onAvatarPointerUp}
+              onPointerLeave={onAvatarPointerUp}
+            >
+              <canvas ref={avatarCanvasRef} width={220} height={220} className="w-full h-full" />
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs text-white/50">缩放</div>
+              <input
+                type="range"
+                min={1}
+                max={3}
+                step={0.01}
+                value={avatarZoom}
+                onChange={(e) => setAvatarView(+e.target.value, avatarPosRef.current)}
+                className="w-full accent-[#e5a349]"
+              />
+            </div>
+            <p className="text-xs text-white/40 text-center">拖动图片调整位置</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setAvatarEditorOpen(false)}
+                className="flex-1 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 text-sm"
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmAvatar}
+                className="flex-1 py-2 rounded-xl bg-[#e5a349] hover:bg-[#e5a349]/90 text-black text-sm font-medium"
+              >
+                使用
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

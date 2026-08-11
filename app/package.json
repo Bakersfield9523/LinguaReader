@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "setup": "npm install && npx drizzle-kit push",
-    "build": "vite build && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --external:better-sqlite3 --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\" && node postbuild.mjs",
+    "build": "vite build && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --external:better-sqlite3 --external:@libsql/client --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\" && node postbuild.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "node dist/boot.js",
@@ -20,6 +20,7 @@
   "dependencies": {
     "@hono/node-server": "^1.14.3",
     "@hookform/resolvers": "^5.2.2",
+    "@libsql/client": "^0.10.0",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",
     "@radix-ui/react-aspect-ratio": "^1.1.8",

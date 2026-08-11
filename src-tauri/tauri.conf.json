@@ -36,9 +36,7 @@
     "resources": {
       "../app/dist/boot.js": "boot.js",
       "../app/dist/package.json": "package.json",
-      "../app/dist/node_modules/better-sqlite3": "node_modules/better-sqlite3",
-      "../app/dist/node_modules/bindings": "node_modules/bindings",
-      "../app/dist/node_modules/file-uri-to-path": "node_modules/file-uri-to-path"
+      "../app/dist/node_modules": "node_modules"
     },
     "windows": {
       "nsis": {

@@ -67,6 +67,10 @@ export function useAuth() {
 
   const changePasswordMutation = trpc.auth.changePassword.useMutation();
 
+  const forgotPasswordLookupMutation = trpc.auth.forgotPasswordLookup.useMutation();
+  const verifySecurityAnswerMutation = trpc.auth.verifySecurityAnswer.useMutation();
+  const resetPasswordMutation = trpc.auth.resetPassword.useMutation();
+
   const logout = useCallback(() => {
     setToken(null);
     setUser(null);
@@ -95,6 +99,21 @@ export function useAuth() {
     [updateProfileMutation],
   );
 
+  const forgotPasswordLookup = useCallback(
+    async (account: string) => forgotPasswordLookupMutation.mutateAsync({ account }),
+    [forgotPasswordLookupMutation],
+  );
+  const verifySecurityAnswer = useCallback(
+    async (account: string, answer: string) =>
+      verifySecurityAnswerMutation.mutateAsync({ account, answer }),
+    [verifySecurityAnswerMutation],
+  );
+  const resetPassword = useCallback(
+    async (resetToken: string, newPassword: string) =>
+      resetPasswordMutation.mutateAsync({ resetToken, newPassword }),
+    [resetPasswordMutation],
+  );
+
   return {
     user,
     token,
@@ -105,7 +124,13 @@ export function useAuth() {
     logout,
     updateProfile,
     changePassword: changePasswordMutation.mutateAsync,
+    forgotPasswordLookup,
+    verifySecurityAnswer,
+    resetPassword,
     registerError: registerMutation.error,
     loginError: loginMutation.error,
+    forgotLookupError: forgotPasswordLookupMutation.error,
+    verifyAnswerError: verifySecurityAnswerMutation.error,
+    resetError: resetPasswordMutation.error,
   };
 }
