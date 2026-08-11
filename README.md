@@ -1,6 +1,6 @@
 # LinguaReader
 
-桌面端电子书阅读器（EPUB / PDF），基于 Tauri 2 + React + Vite + Rust 构建，内置生词本、词典、AI 辅助阅读等功能。
+桌面端电子书阅读器（EPUB / PDF），基于 Tauri 2 + React + Vite + Rust 构建，内置生词本、词典、AI 辅助阅读等功能。阅读器主体由人工智能KIMI完成。
 
 ## 技术栈
 
