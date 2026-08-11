@@ -11,8 +11,8 @@ import zipfile
 from pathlib import Path
 
 # --- Config ---
-DOWNLOAD_DIR = Path("C:/Users/18995/Downloads")
-OUTPUT_DIR = Path("C:/Users/18995/WorkBuddy/2026-06-13-18-49-16/kimi_book_platform/app/src/lib")
+DOWNLOAD_DIR = Path.home() / "Downloads"
+OUTPUT_DIR = Path(__file__).resolve().parent / "app" / "src" / "lib"
 MAX_ENTRIES = 15000
 
 DICTS = [

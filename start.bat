@@ -13,10 +13,10 @@ set "NODE="
 set "NPM="
 set "NPX="
 
-if exist "C:\Users\18995\.workbuddy\binaries\node\versions\22.22.2\node.exe" (
-    set "NODE=C:\Users\18995\.workbuddy\binaries\node\versions\22.22.2\node.exe"
-    set "NPM=C:\Users\18995\.workbuddy\binaries\node\versions\22.22.2\npm.cmd"
-    set "NPX=C:\Users\18995\.workbuddy\binaries\node\versions\22.22.2\npx.cmd"
+if exist "%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2\node.exe" (
+    set "NODE=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2\node.exe"
+    set "NPM=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2\npm.cmd"
+    set "NPX=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2\npx.cmd"
     echo [OK] Node.js v22.22.2 - managed
 )
 
