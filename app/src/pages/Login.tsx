@@ -3,6 +3,17 @@ import { BookOpen, Mail, Phone, Lock, User, ArrowLeft, Loader2 } from 'lucide-re
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/hooks/useAuth';
 
+// 纯前端密码强度评估（不发送到服务器）
+function getPasswordStrength(pw: string): number {
+  let score = 0;
+  if (pw.length >= 8) score++;
+  if (pw.length >= 12) score++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
+  if (/\d/.test(pw)) score++;
+  if (/[^A-Za-z0-9]/.test(pw)) score++;
+  return score; // 0-5
+}
+
 interface LoginProps {
   onBack: () => void;
 }
@@ -16,6 +27,16 @@ export function Login({ onBack }: LoginProps) {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
+
+  const strength = getPasswordStrength(password);
+  const strengthMeta = [
+    { label: '', bar: 'bg-white/10', text: 'text-white/40' },
+    { label: '弱', bar: 'bg-red-400', text: 'text-red-400' },
+    { label: '较弱', bar: 'bg-orange-400', text: 'text-orange-400' },
+    { label: '中等', bar: 'bg-yellow-400', text: 'text-yellow-400' },
+    { label: '强', bar: 'bg-green-400', text: 'text-green-400' },
+    { label: '很强', bar: 'bg-green-500', text: 'text-green-500' },
+  ][Math.min(strength, 5)];
 
   const { login, register, isLoading } = useAuth();
 
@@ -36,6 +57,7 @@ export function Login({ onBack }: LoginProps) {
           ...(tab === 'email' ? { email: email.trim() } : { phone: phone.trim() }),
           password,
         });
+        onBack();
       } catch (err: any) {
         setError(err.message || '注册失败');
       }
@@ -46,6 +68,7 @@ export function Login({ onBack }: LoginProps) {
 
       try {
         await login(account, password);
+        onBack();
       } catch (err: any) {
         setError(err.message || '登录失败');
       }
@@ -158,6 +181,22 @@ export function Login({ onBack }: LoginProps) {
               className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-[#e5a349]/50"
             />
           </div>
+
+          {mode === 'register' && password.length > 0 && (
+            <div className="px-1 -mt-2">
+              <div className="flex gap-1">
+                {[1, 2, 3, 4, 5].map((i) => (
+                  <div
+                    key={i}
+                    className={`h-1 flex-1 rounded-full ${i <= strength ? strengthMeta.bar : 'bg-white/10'}`}
+                  />
+                ))}
+              </div>
+              {strengthMeta.label && (
+                <p className={`text-xs mt-1 ${strengthMeta.text}`}>密码强度：{strengthMeta.label}</p>
+              )}
+            </div>
+          )}
 
           {mode === 'register' && (
             <div className="relative">
