@@ -266,13 +266,23 @@ pub fn run() {
 }
 
 fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
-    // 优先使用 Tauri 资源目录中的 boot.js（生产安装包）
-    let resource_dir = handle.path().resource_dir().ok()?;
-    let candidates = vec![
-        resource_dir.join("boot.js"),
-        std::path::PathBuf::from("../app/dist/boot.js"),
-        std::path::PathBuf::from("app/dist/boot.js"),
-    ];
+    // 资源目录（安装包场景：boot.js 由 NSIS 放入 resource_dir）
+    let resource_dir = handle.path().resource_dir().ok();
+    // 松散分发场景：boot.js 与 exe 同目录（或 exe 上级的 app/dist），
+    // 否则 loose exe 找不到后端脚本，导致整个后端无法启动、注册/登录全部 Failed to fetch。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &exe_dir {
+        candidates.push(dir.join("boot.js"));
+        candidates.push(dir.join("../app/dist/boot.js"));
+    }
+    if let Some(rd) = &resource_dir {
+        candidates.push(rd.join("boot.js"));
+    }
+    candidates.push(std::path::PathBuf::from("../app/dist/boot.js"));
+    candidates.push(std::path::PathBuf::from("app/dist/boot.js"));
 
     // 日志路径：应用数据目录下的 backend.log（便于排查启动失败）
     let log_path: Option<PathBuf> = handle
@@ -284,8 +294,21 @@ fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
     for backend_script in &candidates {
         if backend_script.exists() {
             log::info!("Starting backend: {:?} on port {}", backend_script, port);
-            let work_dir = backend_script.parent().map(|p| p.to_path_buf()).unwrap_or(resource_dir.clone());
-            match Command::new("node")
+            let work_dir = backend_script
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+            // 优先使用与 exe 同目录的 node.exe，避免系统 PATH 上其它 Node 版本
+            // 导致 better-sqlite3 等原生模块 ABI 不兼容（例：v24 ABI 137 vs v22 ABI 127）。
+            let node_bin = exe_dir
+                .as_ref()
+                .map(|d| d.join("node.exe"))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| PathBuf::from("node"));
+            log::info!("Using node binary: {:?}", node_bin);
+
+            match Command::new(&node_bin)
                 .arg(backend_script)
                 .current_dir(work_dir)
                 .env("NODE_ENV", "production")

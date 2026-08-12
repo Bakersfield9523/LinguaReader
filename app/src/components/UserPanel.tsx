@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { User, LogOut, Upload, Edit2, Check, X, Cloud, Loader2, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/hooks/useAuth';
@@ -119,6 +119,22 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
     updateProfile({ avatar: compressed });
     setAvatarEditorOpen(false);
   };
+
+  // 裁剪器打开后，等 <canvas> 真正挂载到 DOM 再绘制，否则 drawAvatar 因
+  // avatarCanvasRef.current 为 null 提前 return，导致弹出的裁剪框是空白的。
+  useEffect(() => {
+    if (!avatarEditorOpen) return;
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(drawAvatar);
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [avatarEditorOpen]);
 
   // 修改名字
   const handleNameSave = () => {

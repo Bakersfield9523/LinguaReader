@@ -38,9 +38,15 @@ if (env.isProduction) {
   const { serveStaticFiles } = await import("./lib/vite");
   serveStaticFiles(app);
 
-  // 远程数据库（Turso/libSQL）初始化：在监听端口前确保云端连接与表结构就绪
+  // 远程数据库（Turso/libSQL）初始化：在监听端口前确保云端连接与表结构就绪。
+  // 用 try/catch 包裹：云端配置错误或网络不可达时，绝不影响本地 SQLite 后端的启动，
+  // 避免“云端没配好 → 整个世界（注册/登录/书架）全部 Failed to fetch”的连锁崩溃。
   const { initRemoteDb } = await import("./queries/connection");
-  await initRemoteDb();
+  try {
+    await initRemoteDb();
+  } catch (e) {
+    console.error("initRemoteDb failed, falling back to local SQLite:", e);
+  }
 
   const port = parseInt(process.env.PORT || "3000");
   serve({ fetch: app.fetch, port }, () => {

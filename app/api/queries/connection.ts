@@ -110,6 +110,9 @@ const CREATE_TABLES_SQL = `
 
 let instance: any;
 let libsqlClient: any = null;
+// 远程（Turso/libSQL）是否真正初始化成功。仅在成功时走云端分支；
+// 失败时 getDb() 回退到本地 SQLite，避免“云端没配好 → 注册/登录/书架全部抛错”的连锁崩溃。
+let remoteReady = false;
 
 function isRemoteDb(url: string): boolean {
   return url.startsWith("libsql:") || url.startsWith("https:") || url.startsWith("http:");
@@ -148,16 +151,20 @@ function migrateLocalSchema(sqlite: InstanceType<typeof Database>) {
 export function getDb() {
   if (!instance) {
     const url = env.databaseUrl;
-    if (isRemoteDb(url)) {
-      // 远程模式：连接实例应在启动时由 initRemoteDb() 预先建立（见 boot.ts）。
-      // 正常流程下 instance 已就绪，这里兜底再建一次以防万一。
-      if (!libsqlClient) {
-        throw new Error("远程数据库尚未初始化，请确认启动流程调用了 initRemoteDb()");
-      }
+    if (isRemoteDb(url) && remoteReady && libsqlClient) {
+      // 远程模式：连接实例已在 initRemoteDb() 中建立就绪
       instance = drizzleLibsql(libsqlClient, { schema: fullSchema });
     } else {
-      // 本地 SQLite：单机模式（默认 / 未配置云数据库时的兜底）
-      const dbPath = resolveDbPath(url);
+      // 本地 SQLite：兜底分支，覆盖三种情况：
+      //  1) 未配置 DATABASE_URL（默认）；
+      //  2) 配置了远程但未初始化成功（云端故障/网络/凭证错误）→ 安全回退，不抛错；
+      //  3) 任何意外路径。
+      if (isRemoteDb(url) && !remoteReady) {
+        console.warn(
+          "[db] 远程数据库未就绪，已回退到本地 SQLite（本次会话数据不会同步到云端）"
+        );
+      }
+      const dbPath = resolveDbPath(env.localDatabaseUrl);
       fs.mkdirSync(path.dirname(dbPath), { recursive: true });
       const sqlite = new Database(dbPath);
       sqlite.pragma("journal_mode = WAL");
@@ -204,4 +211,8 @@ export async function initRemoteDb(): Promise<void> {
       /* 列已存在则忽略 */
     }
   }
+
+  // 全部建表/改表成功后才标记远程就绪，getDb() 据此决定是否走云端分支。
+  // 若上面任一步抛错，异常会冒泡到 boot.ts 的 try/catch，remoteReady 保持 false → 回退本地。
+  remoteReady = true;
 }

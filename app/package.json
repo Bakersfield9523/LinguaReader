@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "setup": "npm install && npx drizzle-kit push",
-    "build": "vite build && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --external:better-sqlite3 --external:@libsql/client --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\" && node postbuild.mjs",
+    "build": "vite build && node scripts/bundle-boot.mjs && node postbuild.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "node dist/boot.js",

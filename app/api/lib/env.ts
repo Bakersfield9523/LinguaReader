@@ -8,6 +8,7 @@ import crypto from "crypto";
 // 从脚本所在目录向上查找 .env，确保 Tauri 启动时 CWD 不在 app/ 也能找到配置
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const candidatePaths = [
+  path.resolve(__dirname, ".env"),              // 松散部署：boot.js 与 .env 同目录（如 Desktop/LinguaReader/.env）
   path.resolve(__dirname, "..", ".env"),       // 生产环境 boot.js 在 dist/
   path.resolve(__dirname, "..", "..", ".env"), // 开发环境 env.ts 在 api/lib/
   path.resolve(process.cwd(), ".env"),           // 最后回退到 CWD
@@ -46,9 +47,16 @@ function getOrCreatePersistentSecret(dataDir: string): string {
 
 // 在生产环境：数据库和密钥使用用户数据目录，避免写入安装目录
 const appDataDir = getAppDataDir();
-const databaseUrl = isProduction
+// 本地 SQLite 兜底路径（生产用用户数据目录，开发用项目内 ./data）。
+// 与云端 DATABASE_URL 解耦：无论云端是否配置/可用，本地兜底的落盘位置都保持一致，
+// 避免云端故障时回退到“另一个空库”导致已有本地数据看似丢失。
+const localDatabaseUrl = isProduction
   ? `file:${path.join(appDataDir, "data", "lingua.db")}`
-  : (process.env.DATABASE_URL || "file:./data/lingua.db");
+  : "file:./data/lingua.db";
+
+// 生产环境也优先读取 .env 里的 DATABASE_URL（libsql:/https:/http: 即远程云端），
+// 未配置时回退到本地 SQLite。原实现在生产模式硬编码本地路径，导致云端永远不生效。
+const databaseUrl = process.env.DATABASE_URL || localDatabaseUrl;
 
 const appSecret = isProduction
   ? getOrCreatePersistentSecret(appDataDir)
@@ -59,6 +67,7 @@ export const env = {
   appSecret,
   isProduction,
   databaseUrl,
+  localDatabaseUrl,
   appDataDir,
   appRoot,
 };
