@@ -19,6 +19,7 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
   const [avatarEditorOpen, setAvatarEditorOpen] = useState(false);
   const [avatarSrc, setAvatarSrc] = useState('');
   const [avatarZoom, setAvatarZoom] = useState(1);
+  const [avatarPos, setAvatarPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const avatarZoomRef = useRef(1);
   const avatarPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const avatarImgRef = useRef<HTMLImageElement | null>(null);
@@ -106,18 +107,29 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
     avatarDragRef.current = null;
   };
 
-  const confirmAvatar = () => {
+  const confirmAvatar = async () => {
+    const img = avatarImgRef.current;
     const canvas = avatarCanvasRef.current;
-    if (!canvas) return;
+    if (!canvas || !img) return;
+    // 导出前强制按当前缩放/位置重绘一次，避免拿到过期或空白的预览帧
+    // （缩放/拖动的渲染时序若没及时刷新，直接拷贝会导出旧图）。
+    drawAvatar();
     const out = document.createElement('canvas');
-    out.width = 256;
-    out.height = 256;
+    const OUT = 200;
+    out.width = OUT;
+    out.height = OUT;
     const octx = out.getContext('2d');
     if (!octx) return;
-    octx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 256, 256);
-    const compressed = out.toDataURL('image/png');
-    updateProfile({ avatar: compressed });
-    setAvatarEditorOpen(false);
+    octx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, OUT, OUT);
+    // 用 JPEG（更小更稳），避免大尺寸 PNG 偶发超出体积被后端拒收。
+    const compressed = out.toDataURL('image/jpeg', 0.85);
+    if (!compressed || compressed.length < 50) return; // 导出异常保护
+    try {
+      await updateProfile({ avatar: compressed });
+      setAvatarEditorOpen(false);
+    } catch (err: any) {
+      alert('头像更新失败：' + (err?.message || '请重试'));
+    }
   };
 
   // 裁剪器打开后，等 <canvas> 真正挂载到 DOM 再绘制，否则 drawAvatar 因
