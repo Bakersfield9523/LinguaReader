@@ -2,12 +2,14 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { Routes, Route, useNavigate } from 'react-router';
 import { Navbar } from '@/components/Navbar';
 import { Library } from '@/components/Library';
+import { BookshelfSidebar } from '@/components/BookshelfSidebar';
 import { Reader } from '@/components/Reader';
 import { Vocabulary } from '@/components/Vocabulary';
 import { UserPanel } from '@/components/UserPanel';
 import { Login } from '@/pages/Login';
 import { useBooks, useWordMarkers, useFolders } from '@/hooks/useStore';
 import { BookDB } from '@/lib/db';
+import { cn } from '@/lib/utils';
 import type { Book } from '@/types';
 import './App.css';
 
@@ -19,6 +21,23 @@ function MainApp() {
   const { books, loading: booksLoading, addBook, deleteBook, updateBookProgress, refresh: refreshBooks } = useBooks();
   const { words, addWord, updateWord, deleteWord } = useWordMarkers();
   const { folders, loading: foldersLoading, addFolder, updateFolder, deleteFolder } = useFolders();
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null | undefined>(undefined);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('bookshelf_collapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  // 书架收起状态持久化
+  useEffect(() => {
+    try {
+      localStorage.setItem('bookshelf_collapsed', sidebarCollapsed ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarCollapsed]);
 
   // 当 books 数组更新时，同步更新 currentBook 以确保 Reader 收到最新的进度
   // 但只在关键字段实际变化时才更新，避免不必要的重渲染
@@ -83,25 +102,8 @@ function MainApp() {
           />
         );
 
-      case 'library':
       default:
-        return (
-          <Library
-            books={books}
-            folders={folders}
-            onAddBook={addBook}
-            onDeleteBook={deleteBook}
-            onOpenBook={handleOpenBook}
-            onAddFolder={addFolder}
-            onUpdateFolder={updateFolder}
-            onDeleteFolder={deleteFolder}
-            onMoveBook={async (bookId, folderId) => {
-              await BookDB.moveToFolder(bookId, folderId);
-              refreshBooks();
-            }}
-            loading={booksLoading || foldersLoading}
-          />
-        );
+        return null;
     }
   };
 
@@ -113,21 +115,76 @@ function MainApp() {
         <div className="absolute -bottom-1/2 -left-1/2 w-full h-full bg-gradient-radial from-[#7ca2b5]/5 via-transparent to-transparent opacity-30" />
       </div>
 
-      {/* Navigation */}
-      {currentView !== 'reader' && (
+      {currentView === 'reader' ? (
+        <main className="relative z-10">
+          {renderView()}
+        </main>
+      ) : (
         <>
-          <Navbar currentView={currentView} onViewChange={setCurrentView} />
+          {/* Navigation — 图书馆视图时左侧让出侧边栏空间，Logo 放到侧边栏头部 */}
+          <Navbar
+            currentView={currentView}
+            onViewChange={setCurrentView}
+            showLogo={currentView !== 'library'}
+            className={
+              currentView === 'library'
+                ? sidebarCollapsed
+                  ? 'left-16'
+                  : 'left-60'
+                : 'left-0'
+            }
+          />
           {/* User Panel - 右上角 */}
           <div className="fixed top-4 right-4 z-50">
             <UserPanel onLoginClick={() => navigate('/login')} />
           </div>
+
+          {currentView === 'library' ? (
+            <div
+              className={cn(
+                'relative z-10 flex transition-all duration-300',
+                sidebarCollapsed ? 'ml-16' : 'ml-60',
+              )}
+            >
+              {/* 左侧书架侧边栏（可展开/收起） */}
+              <BookshelfSidebar
+                books={books}
+                folders={folders}
+                selectedFolderId={selectedFolderId}
+                onSelectFolder={setSelectedFolderId}
+                onAddFolder={addFolder}
+                onUpdateFolder={updateFolder}
+                onDeleteFolder={(id: string) => {
+                  deleteFolder(id);
+                  setSelectedFolderId((prev) => (prev === id ? undefined : prev));
+                }}
+                collapsed={sidebarCollapsed}
+                onCollapsedChange={setSidebarCollapsed}
+              />
+              {/* 主内容区 */}
+              <main className="flex-1 min-w-0">
+                <Library
+                  books={books}
+                  folders={folders}
+                  selectedFolderId={selectedFolderId}
+                  onAddBook={addBook}
+                  onDeleteBook={deleteBook}
+                  onOpenBook={handleOpenBook}
+                  onMoveBook={async (bookId, folderId) => {
+                    await BookDB.moveToFolder(bookId, folderId);
+                    refreshBooks();
+                  }}
+                  loading={booksLoading || foldersLoading}
+                />
+              </main>
+            </div>
+          ) : (
+            <main className="relative z-10">
+              {renderView()}
+            </main>
+          )}
         </>
       )}
-
-      {/* Main Content */}
-      <main className="relative z-10">
-        {renderView()}
-      </main>
     </div>
   );
 }

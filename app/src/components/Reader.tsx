@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { lookupWord, getQuickTranslation } from '@/lib/dictionary';
-import { EPUBParser, PDFParser, getBookContent } from '@/lib/fileParser';
+import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob } from '@/lib/fileParser';
 import { BookDB, HighlightDB } from '@/lib/db';
 import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse } from '@/lib/aiService';
 import { SettingsDialog } from './SettingsDialog';
@@ -408,6 +408,20 @@ export function Reader({
   );
   const [pdfTotalPages, setPdfTotalPages] = useState(0);
   const [pdfHighlightVersion, setPdfHighlightVersion] = useState(0);
+  // PDF 渲染所需的文件载荷：新书籍直接是 Blob；旧书首次打开时在此异步迁移为 Blob（避免 500MB base64 字符串常驻内存）
+  const [pdfFileData, setPdfFileData] = useState<string | Blob>(book.fileData);
+
+  // 书籍切换时，将 fileData 规范为 Blob 供 PDF 渲染（旧 base64 书在此一次性迁移）
+  useEffect(() => {
+    let isMounted = true;
+    setPdfFileData(book.fileData);
+    if (typeof book.fileData === 'string') {
+      getFileDataAsBlob(book).then((blob) => {
+        if (isMounted) setPdfFileData(blob);
+      }).catch(() => {});
+    }
+    return () => { isMounted = false; };
+  }, [book.id, book.fileData]);
 
   // 阅读时长记录
   const readStartTimeRef = useRef<number>(Date.now());
@@ -445,6 +459,11 @@ export function Reader({
   const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 标记是否已经恢复过滚动位置（防止循环）
   const scrollRestoredRef = useRef(false);
+  // 待恢复的滚动位置（在组件挂载时从 book.scrollPosition 捕获一次，
+  // 避免后续章节切换/进度保存把 DB 里的值覆盖后影响恢复）。
+  const pendingRestorePosRef = useRef(book.scrollPosition || 0);
+  // 是否已挂载过：用于区分"初次打开"与"切换章节"，切换章节时让新章节从顶部开始。
+  const readerMountedRef = useRef(false);
   // 用 ref 保存最新进度，避免闭包陷阱
   const bookProgressRef = useRef(book.progress || 0);
   bookProgressRef.current = book.progress || 0;
@@ -809,9 +828,11 @@ export function Reader({
   }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
 
-  // 恢复滚动位置（只在 EPUB/TXT 模式下，且只执行一次）
+  // 恢复滚动位置（只在 EPUB/TXT 非 iframe 模式下，且只执行一次）
   const restoreScrollPosition = useCallback(() => {
     if (book.format === 'pdf') return;
+    // EPUB iframe 模式的滚动发生在 iframe 内部文档，恢复逻辑在 handleIframeLoad 中处理
+    if (book.format === 'epub' && epubRenderMode === 'iframe') return;
     if (scrollRestoredRef.current) return;
     if (!contentRef.current || !chapterContent) return;
     const pos = book.scrollPosition || scrollPosRef.current;
@@ -1344,7 +1365,6 @@ export function Reader({
   );
 
   // 标记/高亮变化：重建内容并重新应用（保留滚动位置）。
-  // 放在 currentChapterHighlights 声明之后，避免 const 前向引用（TS2448/2454）与运行时 TDZ。
   useEffect(() => {
     const f = iframeRef.current;
     const doc = f && f.contentDocument;
@@ -1477,7 +1497,29 @@ export function Reader({
     // 绑定交互事件（在 iframe 文档上，绕开 CSP 内联脚本限制）
     doc.body.addEventListener('click', onIframeClick as EventListener);
     doc.body.addEventListener('mouseup', onIframeMouseup as EventListener);
-  }, [settings.fontSize, settings.lineHeight, settings.theme, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup]);
+    // 绑定滚动监听：iframe 内部滚动不会冒泡到父级 <main>（其 overflow-hidden），
+    // 必须直接监听 iframe 自身的 window，否则滚动位置永远无法捕获/保存。
+    if (f.contentWindow) {
+      f.contentWindow.addEventListener('scroll', handleScroll, { passive: true });
+    }
+    // 恢复上次阅读位置：iframe 内部滚动需直接操作 iframe 文档的 scrollingElement。
+    // 使用 pendingRestorePosRef（挂载时捕获的 DB 值），避免被后续进度保存覆盖。
+    const savedPos = pendingRestorePosRef.current;
+    if (!readerMountedRef.current) {
+      // 初次打开：标记已挂载，后续章节切换不再视为"初次"
+      readerMountedRef.current = true;
+    } else {
+      // 章节切换：新章节从顶部开始，不沿用上一章的残留位置
+      pendingRestorePosRef.current = 0;
+    }
+    if (savedPos > 0) {
+      requestAnimationFrame(() => {
+        const scEl = doc.scrollingElement || doc.body;
+        const max = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
+        scEl.scrollTop = (savedPos / 100) * max;
+      });
+    }
+  }, [settings.fontSize, settings.lineHeight, settings.theme, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup, handleScroll]);
 
   // 渲染内容区域 — 普通函数，不需要 useCallback（每次渲染直接调用）
   const renderContent = () => {
@@ -1485,7 +1527,7 @@ export function Reader({
       return (
         <div className="py-6">
           <PDFCanvasViewer
-            fileData={book.fileData}
+            fileData={pdfFileData}
             pageNum={pdfCurrentPage}
             bookId={book.id}
             chapterIndex={pdfCurrentPage - 1}
@@ -2099,6 +2141,9 @@ export function Reader({
                   <div className="flex items-start justify-between">
                     <div>
                       <h2 className="text-3xl font-bold">{selectedWord}</h2>
+                      {dictionaryData?.lemma && dictionaryData.lemma !== selectedWord.toLowerCase() && (
+                        <p className="text-sm opacity-60 mt-1">原形：{dictionaryData.lemma}</p>
+                      )}
                       <div className="mt-2">
                         <PronunciationButtons
                           word={selectedWord}
@@ -2580,6 +2625,7 @@ function iframeCleanWord(w: string, isPhrase: boolean): string {
   if (isPhrase) return w.trim().replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
   return w.replace(/[\p{P}\p{S}]/gu, '');
 }
+
 function iframeGetSentence(block: HTMLElement, raw: string): string {
   const full = block ? (block.textContent || '') : '';
   const idx = full.toLowerCase().indexOf(raw.toLowerCase());
@@ -2718,6 +2764,8 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
     }
   }
 }
+
+// 应用"结构"（设置/标记词/脚注上标）并应用高亮。
 function iframeApplyAll(doc: Document, cleanHtml: string, s: IframeSettings, wordsSet: Set<string>, list: IframeHighlight[]) {
   doc.body.innerHTML = cleanHtml;
   iframeApplySettings(doc, s);

@@ -452,3 +452,83 @@ textarea:focus-visible {
 .reader-theme-light .reader-html-content a {
   color: #c47a1a;
 }
+
+/* ===== PDF 真实文字层 + CSS Custom Highlight API ===== */
+/* TextLayer 渲染的 span 文字设为透明，避免与 Canvas 渲染的字形重影。
+   真实字形由底层 Canvas 绘制，高亮/标记/选区用 ::highlight 字符级染色，
+   零缝隙贴合字形轮廓，天然跨节点连续（连字符断词也能一条线画完）。
+   下面复制自 pdf.js viewer 的 .textLayer 样式，确保 span 的 transform/scale/font-size
+   等 CSS 变量能正确解析；否则 --total-scale-factor 未定义会导致布局失效。 */
+.pdf-text-layer {
+  --user-unit: 1;
+  --scale-factor: 1;
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
+  --min-font-size: 1;
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+
+  position: absolute;
+  inset: 0;
+  text-align: initial;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+  color: transparent;
+}
+
+.pdf-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.pdf-text-layer > :not(.markedContent),
+.pdf-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdf-text-layer .markedContent {
+  display: contents;
+}
+
+.pdf-text-layer span[role="img"] {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* 高亮（已保存/已划线）：最实 */
+::highlight(pdf-hl) {
+  background-color: rgba(229, 163, 73, 0.55);
+}
+
+/* 标记（书签/锚点类弱高亮）：较淡 */
+::highlight(pdf-mark) {
+  background-color: rgba(229, 163, 73, 0.40);
+}
+
+/* 拖拽选区临时高亮：最淡 */
+::highlight(pdf-sel) {
+  background-color: rgba(229, 163, 73, 0.25);
+}
+
+/* 下划线标记（如生词本/收藏词）：橙色下划线 */
+::highlight(pdf-ul) {
+  text-decoration: underline;
+  text-decoration-color: #e5a349;
+}

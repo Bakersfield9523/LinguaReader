@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Plus, Upload, Trash2, MoreVertical, FileText, X, Check, Globe, Loader2, Image as ImageIcon, Folder, FolderOpen, Edit2, Move, FolderPlus, Sparkles } from 'lucide-react';
+import { Plus, Upload, Trash2, MoreVertical, FileText, X, Check, Globe, Loader2, Image as ImageIcon, Folder, Edit2, Move, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
@@ -29,30 +29,25 @@ const LANGUAGE_BADGE_COLOR: Record<Language, string> = {
 interface LibraryProps {
   books: Book[];
   folders: FolderType[];
+  selectedFolderId: string | null | undefined;
   onAddBook: (book: Book) => void;
   onDeleteBook: (id: string) => void;
   onOpenBook: (book: Book) => void;
-  onAddFolder: (folder: FolderType) => void;
-  onUpdateFolder: (id: string, updates: Partial<FolderType>) => void;
-  onDeleteFolder: (id: string) => void;
   onMoveBook: (bookId: string, folderId: string | null) => void;
   loading: boolean;
 }
 
-export function Library({ 
-  books, 
-  folders, 
-  onAddBook, 
-  onDeleteBook, 
-  onOpenBook, 
-  onAddFolder, 
-  onUpdateFolder, 
-  onDeleteFolder,
+export function Library({
+  books,
+  folders,
+  selectedFolderId,
+  onAddBook,
+  onDeleteBook,
+  onOpenBook,
   onMoveBook,
-  loading 
+  loading
 }: LibraryProps) {
   const [importDialogOpen, setImportDialogOpen] = useState(false);
-  const [folderDialogOpen, setFolderDialogOpen] = useState(false);
   const [moveDialogOpen, setMoveDialogOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isParsing, setIsParsing] = useState(false);
@@ -64,14 +59,8 @@ export function Library({
     type: '',
     folderId: ''
   });
-  const [folderFormData, setFolderFormData] = useState({
-    name: '',
-    editingId: null as string | null
-  });
   const [customCover, setCustomCover] = useState<string | undefined>(undefined);
   const [isDragging, setIsDragging] = useState(false);
-  const [expandedFolders] = useState<Set<string>>(new Set());
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null | undefined>(undefined);
   const [bookToMove, setBookToMove] = useState<string | null>(null);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showCalendar, setShowCalendar] = useState(false);
@@ -126,7 +115,7 @@ export function Library({
   const getSelectedFolderName = useCallback(() => {
     if (selectedFolderId === null) return '未分类';
     const folder = folders.find(f => f.id === selectedFolderId);
-    return folder?.name || '未知文件夹';
+    return folder?.name || '未知书架';
   }, [selectedFolderId, folders]);
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -226,32 +215,6 @@ export function Library({
     }
   }, [formData.title]);
 
-  // 创建/编辑文件夹
-  const handleSaveFolder = useCallback(() => {
-    if (!folderFormData.name.trim()) return;
-    
-    if (folderFormData.editingId) {
-      onUpdateFolder(folderFormData.editingId, { name: folderFormData.name.trim() });
-    } else {
-      const newFolder: FolderType = {
-        id: crypto.randomUUID(),
-        name: folderFormData.name.trim(),
-        createdAt: Date.now()
-      };
-      onAddFolder(newFolder);
-    }
-    
-    setFolderFormData({ name: '', editingId: null });
-    setFolderDialogOpen(false);
-  }, [folderFormData, onAddFolder, onUpdateFolder]);
-
-  // 打开编辑文件夹对话框
-  const openEditFolder = useCallback((folder: FolderType, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setFolderFormData({ name: folder.name, editingId: folder.id });
-    setFolderDialogOpen(true);
-  }, []);
-
   // 打开移动书籍对话框
   const openMoveDialog = useCallback((bookId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -342,7 +305,7 @@ export function Library({
               {displayBooks.length > 0 
                 ? `共 ${displayBooks.length} 本书` 
                 : selectedFolderId !== undefined
-                  ? '该文件夹暂无书籍'
+                  ? '该书架暂无书籍'
                   : '导入你的第一本书，开始阅读之旅'}
             </p>
           </div>
@@ -371,24 +334,13 @@ export function Library({
             </Button>
             <Button
               onClick={() => {
-                setFolderFormData({ name: '', editingId: null });
-                setFolderDialogOpen(true);
-              }}
-              variant="ghost"
-              className="bg-[#282b2f] text-white/90 hover:bg-[#33373d] hover:text-white px-4 py-3 border border-white/15"
-            >
-              <FolderPlus className="w-5 h-5 mr-2" />
-              <span>新建文件夹</span>
-            </Button>
-            <Button
-              onClick={() => {
-                // 根据当前选中的文件夹预设导入对话框的文件夹选择
-                // selectedFolderId: undefined = 全部书籍, null = 未分类, string = 具体文件夹
+                // 根据当前选中的书架预设导入对话框的书架选择
+                // selectedFolderId: undefined = 全部书籍, null = 未分类, string = 具体书架
                 const folderId = selectedFolderId === undefined 
-                  ? ''  // 全部书籍视图，不预设文件夹
+                  ? ''  // 全部书籍视图，不预设书架
                   : selectedFolderId === null 
                     ? 'uncategorized'  // 未分类视图
-                    : selectedFolderId;  // 具体文件夹
+                    : selectedFolderId;  // 具体书架
                 setFormData(prev => ({ ...prev, folderId }));
                 setImportDialogOpen(true);
               }}
@@ -399,99 +351,6 @@ export function Library({
             </Button>
           </div>
         </div>
-
-        {/* Folder Navigation */}
-        {folders.length > 0 && (
-          <div className="mb-8">
-            <div className="flex items-center gap-2 mb-4">
-              <span className="text-white/40 text-sm">文件夹</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {/* All Books */}
-              <button
-                onClick={() => setSelectedFolderId(undefined)}
-                className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-all ${
-                  selectedFolderId === undefined
-                    ? 'bg-[#e5a349] text-white'
-                    : 'bg-[#1e2125] text-white/70 hover:bg-[#282b2f]'
-                }`}
-              >
-                <FolderOpen className="w-4 h-4" />
-                <span>全部书籍</span>
-                <span className="text-xs opacity-60">({books.length})</span>
-              </button>
-              
-              {/* Uncategorized */}
-              <button
-                onClick={() => setSelectedFolderId(null)}
-                className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-all ${
-                  selectedFolderId === null
-                    ? 'bg-[#e5a349] text-white'
-                    : 'bg-[#1e2125] text-white/70 hover:bg-[#282b2f]'
-                }`}
-              >
-                <Folder className="w-4 h-4" />
-                <span>未分类</span>
-                <span className="text-xs opacity-60">({getBooksInFolder(null).length})</span>
-              </button>
-              
-              {/* Folders */}
-              {folders.map(folder => {
-                const bookCount = getBooksInFolder(folder.id).length;
-                const isExpanded = expandedFolders.has(folder.id);
-                return (
-                  <div key={folder.id} className="relative group">
-                    <button
-                      onClick={() => setSelectedFolderId(folder.id)}
-                      className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-all ${
-                        selectedFolderId === folder.id
-                          ? 'bg-[#e5a349] text-white'
-                          : 'bg-[#1e2125] text-white/70 hover:bg-[#282b2f]'
-                      }`}
-                    >
-                      {isExpanded ? <FolderOpen className="w-4 h-4" /> : <Folder className="w-4 h-4" />}
-                      <span>{folder.name}</span>
-                      <span className="text-xs opacity-60">({bookCount})</span>
-                    </button>
-                    
-                    {/* Folder Actions */}
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button 
-                          className="absolute -right-2 -top-2 w-6 h-6 rounded-full bg-[#282b2f] border border-white/10 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <MoreVertical className="w-3 h-3 text-white/60" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="bg-[#1e2125] border-white/15">
-                        <DropdownMenuItem
-                          onClick={(e) => openEditFolder(folder, e)}
-                          className="text-white/85 hover:text-white focus:text-white hover:bg-white/8 focus:bg-white/8"
-                        >
-                          <Edit2 className="w-4 h-4 mr-2" />
-                          重命名
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (confirm(`确定要删除文件夹 "${folder.name}" 吗？文件夹内的书籍将移至未分类。`)) {
-                              onDeleteFolder(folder.id);
-                            }
-                          }}
-                          className="text-red-400/90 hover:text-red-300 focus:text-red-300 hover:bg-red-500/10 focus:bg-red-500/10"
-                        >
-                          <Trash2 className="w-4 h-4 mr-2" />
-                          删除
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
 
         {/* Books Grid */}
         {books.length === 0 ? (
@@ -523,7 +382,7 @@ export function Library({
         ) : displayBooks.length === 0 ? (
           <div className="text-center py-20">
             <Folder className="w-16 h-16 text-white/20 mx-auto mb-4" />
-            <p className="text-white/40">该文件夹暂无书籍</p>
+            <p className="text-white/40">该书架暂无书籍</p>
             <Button
               onClick={() => setImportDialogOpen(true)}
               className="mt-4 bg-[#e5a349] hover:bg-[#d49340] text-white shadow-md shadow-[#e5a349]/20"
@@ -624,7 +483,7 @@ export function Library({
                       <div className="mt-2 flex items-center gap-1 text-xs text-[#e5a349]">
                         <Folder className="w-3 h-3" />
                         <span className="truncate">
-                          {folders.find(f => f.id === book.folderId)?.name || '未知文件夹'}
+                          {folders.find(f => f.id === book.folderId)?.name || '未知书架'}
                         </span>
                       </div>
                     )}
@@ -655,7 +514,7 @@ export function Library({
                       className="text-white/85 hover:text-white focus:text-white hover:bg-white/8 focus:bg-white/8"
                     >
                       <Move className="w-4 h-4 mr-2" />
-                      移动到文件夹
+                      移动到书架
                     </DropdownMenuItem>
                     <DropdownMenuSeparator className="bg-white/15" />
                     <DropdownMenuItem
@@ -814,13 +673,13 @@ export function Library({
                   {/* Folder Selection */}
                   {folders && folders.length > 0 && (
                     <div>
-                      <Label htmlFor="folder" className="text-white/80">文件夹</Label>
+                      <Label htmlFor="folder" className="text-white/80">书架</Label>
                       <Select
                         value={formData.folderId || "uncategorized"}
                         onValueChange={(value) => setFormData(prev => ({ ...prev, folderId: value === "uncategorized" ? "" : value }))}
                       >
                         <SelectTrigger className="bg-[#1e2125] border-white/10 text-white mt-2">
-                          <SelectValue placeholder="选择文件夹（可选）" />
+                          <SelectValue placeholder="选择书架（可选）" />
                         </SelectTrigger>
                         <SelectContent className="bg-[#282b2f] border-white/10">
                           <SelectItem value="uncategorized" className="text-white/60">
@@ -911,59 +770,11 @@ export function Library({
         </DialogContent>
       </Dialog>
 
-      {/* Folder Dialog */}
-      <Dialog open={folderDialogOpen} onOpenChange={setFolderDialogOpen}>
-        <DialogContent className="bg-[#282b2f] border-white/10 text-white max-w-md">
-          <DialogHeader>
-            <DialogTitle className="text-xl">
-              {folderFormData.editingId ? '重命名文件夹' : '新建文件夹'}
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-4">
-            <div>
-              <Label htmlFor="folderName" className="text-white/80">文件夹名称</Label>
-              <Input
-                id="folderName"
-                value={folderFormData.name}
-                onChange={(e) => setFolderFormData(prev => ({ ...prev, name: e.target.value }))}
-                placeholder="输入文件夹名称"
-                className="bg-[#1e2125] border-white/10 text-white placeholder:text-white/30 mt-2"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    handleSaveFolder();
-                  }
-                }}
-              />
-            </div>
-            <div className="flex gap-3 pt-4">
-              <Button
-                variant="ghost"
-                onClick={() => {
-                  setFolderFormData({ name: '', editingId: null });
-                  setFolderDialogOpen(false);
-                }}
-                className="flex-1 bg-[#1e2125] text-white/85 border border-white/15 hover:bg-[#282b2f] hover:text-white"
-              >
-                取消
-              </Button>
-              <Button
-                onClick={handleSaveFolder}
-                disabled={!folderFormData.name.trim()}
-                className="flex-1 bg-[#e5a349] hover:bg-[#d49340] text-white disabled:opacity-50"
-              >
-                <Check className="w-4 h-4 mr-2" />
-                {folderFormData.editingId ? '保存' : '创建'}
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       {/* Move Book Dialog */}
       <Dialog open={moveDialogOpen} onOpenChange={setMoveDialogOpen}>
         <DialogContent className="bg-[#282b2f] border-white/10 text-white max-w-md">
           <DialogHeader>
-            <DialogTitle className="text-xl">移动到文件夹</DialogTitle>
+            <DialogTitle className="text-xl">移动到书架</DialogTitle>
             <DialogDescription className="text-white/60">
               {bookToMoveInfo && `将 "${bookToMoveInfo.title}" 移动到：`}
             </DialogDescription>

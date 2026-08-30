@@ -1,4 +1,5 @@
 import type { DictionaryDefinition, Language } from '@/types';
+import { lemmatize } from './lemmatize';
 
 // Merriam-Webster Learner's Dictionary API（英文在线词典）
 const MW_BASE_URL = 'https://www.dictionaryapi.com/api/v3/references/learners/json';
@@ -164,21 +165,28 @@ function buildMwAudioUrl(audio: string): string {
   return `https://www.dictionaryapi.com/api/v3/references/learners/audio/${dir}/${audio}.mp3`;
 }
 
+// 在线释义结果缓存：避免同一单词重复发起网络请求（查词/标记卡顿优化）。
+// 命中缓存时直接返回，省去每次点击单词/标记单词时的网络往返。
+const onlineDefCache = new Map<string, DictionaryDefinition | null>();
+
 // 获取英文单词定义（在线 API - Merriam-Webster Learner's）
 async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
+  const cacheKey = word.toLowerCase();
+  if (onlineDefCache.has(cacheKey)) return onlineDefCache.get(cacheKey)!;
+  let result: DictionaryDefinition | null = null;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
-    const url = `${MW_BASE_URL}/${encodeURIComponent(word.toLowerCase())}?key=${MW_API_KEY}`;
+    const url = `${MW_BASE_URL}/${encodeURIComponent(cacheKey)}?key=${MW_API_KEY}`;
     const response = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
-    if (!response.ok) return null;
+    if (!response.ok) { onlineDefCache.set(cacheKey, null); return null; }
 
     const data = await response.json();
-    if (!Array.isArray(data) || data.length === 0) return null;
+    if (!Array.isArray(data) || data.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
 
     // MW 查不到时返回字符串数组（拼写建议）；只保留对象词条
     const entries = data.filter((e: any) => e && typeof e === 'object');
-    if (entries.length === 0) return null;
+    if (entries.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
 
     const firstEntry = entries[0];
     const wordOut = (firstEntry?.meta?.id || firstEntry?.hw || word).replace(/:\d+$/, '');
@@ -205,9 +213,9 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
         walkMw(d?.sseq || [], defs, exs);
       }
     }
-    if (defs.length === 0) return null;
+    if (defs.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
 
-    return {
+    result = {
       word: wordOut,
       phonetic,
       ukPhonetic: phonetic,
@@ -221,8 +229,10 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
     };
   } catch (error) {
     console.error('Dictionary API error:', error);
-    return null;
+    result = null;
   }
+  onlineDefCache.set(cacheKey, result);
+  return result;
 }
 
 // 未找到翻译的提示（按语言）
@@ -264,6 +274,13 @@ export async function lookupWord(word: string, language: Language): Promise<Dict
         }
       }
     }
+
+    // 词形还原回退（本地词典）：原词查不到时尝试还原后的原形
+    for (const lemma of lemmatize(cleanWord, language)) {
+      if (lemma === cleanWord) continue;
+      const r = await lookupLocalDict(lemma, language);
+      if (r) return { ...r, word: cleanWord, lemma };
+    }
     return null;
   }
 
@@ -284,6 +301,13 @@ export async function lookupWord(word: string, language: Language): Promise<Dict
         };
       }
     }
+  }
+
+  // 词形还原回退（英文 MW）：原词查不到时尝试还原后的原形
+  for (const lemma of lemmatize(cleanWord, language)) {
+    if (lemma === cleanWord) continue;
+    const r = await getEnglishDefinition(lemma);
+    if (r) return { ...r, word: cleanWord, lemma };
   }
   return null;
 }

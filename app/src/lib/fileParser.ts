@@ -2,10 +2,17 @@ import ePub from 'epubjs';
 import * as pdfjs from 'pdfjs-dist';
 import type { Book, Chapter, PDFTextItem } from '@/types';
 import type { Language } from '@/types';
+import { BookDB } from './db';
 
 // 导入 worker URL（Vite 会自动处理为静态资源路径）
 // @ts-ignore
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+// ============ 上传大小上限 ============
+// 整本文件会被 base64 编码后存入本地数据库（IndexedDB），故上限受内存/存储影响。
+// 当前设为 500MB；如需更大，请同步评估 base64 膨胀（约 1.33×）与解码开销。
+export const MAX_BOOK_SIZE_MB = 500;
+const MAX_BOOK_SIZE = MAX_BOOK_SIZE_MB * 1024 * 1024;
 
 // ============ 生成唯一ID ============
 function generateId(): string {
@@ -92,8 +99,9 @@ function blobToBase64(blob: Blob): Promise<string> {
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 0x8000; // 32KB 分块，避免逐字节拼接造成 O(n²) 卡顿
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as unknown as number[]);
   }
   return 'data:application/octet-stream;base64,' + btoa(binary);
 }
@@ -115,6 +123,33 @@ function base64ToText(base64: string): string {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return new TextDecoder('utf-8').decode(bytes);
+}
+
+// ============ 文件载荷统一读取（Blob 存储 + 旧 base64 向后兼容） ============
+// 新书籍将整本文件以 Blob 直接存入 IndexedDB（原生支持，无 base64 1/3 膨胀、
+// 无 JS 逐字节解码开销；getAll 加载时仅拿到 Blob 句柄，不读字节，启动/列表更快）。
+// 旧书仍以 base64 字符串存储，这里统一兼容，并在首次打开时迁移为 Blob。
+export async function fileDataToArrayBuffer(fd: string | Blob): Promise<ArrayBuffer> {
+  if (typeof fd !== 'string') return await fd.arrayBuffer();
+  return base64ToArrayBuffer(fd);
+}
+
+export async function fileDataToText(fd: string | Blob): Promise<string> {
+  if (typeof fd !== 'string') return await fd.text();
+  return base64ToText(fd);
+}
+
+/**
+ * 把一本书的 fileData 规范为 Blob（用于 PDF 渲染路径）。
+ * - 已是 Blob：直接返回；
+ * - 仍是旧 base64 字符串：解码为 Blob 并异步写回数据库（一次性迁移，不阻塞打开）。
+ */
+export async function getFileDataAsBlob(book: Book): Promise<Blob> {
+  if (typeof book.fileData !== 'string') return book.fileData as Blob;
+  const ab = base64ToArrayBuffer(book.fileData);
+  const blob = new Blob([ab], { type: book.fileType || 'application/octet-stream' });
+  BookDB.update(book.id, { fileData: blob }).catch(() => {});
+  return blob;
 }
 
 // ============ 默认封面生成 ============
@@ -1171,8 +1206,7 @@ export async function parseTXT(
   }
   
   const textBytes = new TextEncoder().encode(text);
-  const fileDataBase64 = arrayBufferToBase64(textBytes.buffer);
-  
+
   return {
     id: generateId(),
     title: finalTitle,
@@ -1180,7 +1214,7 @@ export async function parseTXT(
     cover,
     language,
     format: 'txt',
-    fileData: fileDataBase64,
+    fileData: new Blob([textBytes.buffer], { type: 'text/plain' }),
     fileType: 'text/plain',
     createdAt: Date.now(),
     chapters,
@@ -1200,10 +1234,8 @@ export async function parseBook(
   }
 ): Promise<Book> {
   const fileName = file.name.toLowerCase();
-  const maxSize = 50 * 1024 * 1024; // 50MB
-  
-  if (file.size > maxSize) {
-    throw new Error('文件过大，请上传小于 50MB 的文件');
+  if (file.size > MAX_BOOK_SIZE) {
+    throw new Error(`文件过大，请上传小于 ${MAX_BOOK_SIZE_MB}MB 的文件`);
   }
   
   try {
@@ -1271,8 +1303,6 @@ async function parseEPUB(
     chapters = [];
   }
   
-  const fileDataBase64 = arrayBufferToBase64(arrayBuffer);
-  
   return {
     id: generateId(),
     title: finalTitle,
@@ -1280,7 +1310,7 @@ async function parseEPUB(
     cover,
     language,
     format: 'epub',
-    fileData: fileDataBase64,
+    fileData: new Blob([arrayBuffer], { type: 'application/epub+zip' }),
     fileType: 'application/epub+zip',
     createdAt: Date.now(),
     chapters: chapters.length > 0 ? chapters : undefined,
@@ -1335,8 +1365,6 @@ async function parsePDF(
     chapters = parser.generateChapters();
   }
   // 使用独立的 saveBuffer，不受 pdfjs 影响
-  const fileDataBase64 = arrayBufferToBase64(saveBuffer);
-  
   return {
     id: generateId(),
     title: finalTitle,
@@ -1344,7 +1372,7 @@ async function parsePDF(
     cover,
     language,
     format: 'pdf',
-    fileData: fileDataBase64,
+    fileData: new Blob([saveBuffer], { type: 'application/pdf' }),
     fileType: 'application/pdf',
     createdAt: Date.now(),
     chapters,
@@ -1361,7 +1389,7 @@ export async function getBookContent(
   const cssContents = new Map<string, string>();
   
   try {
-    const arrayBuffer = base64ToArrayBuffer(book.fileData);
+    const arrayBuffer = await fileDataToArrayBuffer(book.fileData);
     
     if (book.format === 'epub') {
       let parser: EPUBParser;
@@ -1435,7 +1463,7 @@ export async function getBookContent(
     } else if (book.format === 'txt') {
       let text: string;
       try {
-        text = base64ToText(book.fileData);
+        text = await fileDataToText(book.fileData);
       } catch (e) {
         return { parser: null, chapters: book.chapters || [], contents, cssContents };
       }

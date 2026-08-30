@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "setup": "npm install && npx drizzle-kit push",
-    "build": "vite build && node scripts/bundle-boot.mjs && node postbuild.mjs",
+    "build": "node scripts/pre-clean.mjs && vite build && node scripts/bundle-boot.mjs && node postbuild.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "node dist/boot.js",

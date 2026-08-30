@@ -4,9 +4,11 @@ import { useState, useEffect } from 'react';
 interface NavbarProps {
   currentView: 'library' | 'reader' | 'vocabulary';
   onViewChange: (view: 'library' | 'reader' | 'vocabulary') => void;
+  showLogo?: boolean;
+  className?: string;
 }
 
-export function Navbar({ currentView, onViewChange }: NavbarProps) {
+export function Navbar({ currentView, onViewChange, showLogo = true, className = 'left-0' }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -25,25 +27,29 @@ export function Navbar({ currentView, onViewChange }: NavbarProps) {
 
   return (
     <nav
-      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${
+      className={`fixed top-0 right-0 z-50 transition-all duration-500 ${
         scrolled
           ? 'bg-[#282b2f]/90 backdrop-blur-xl shadow-lg'
           : 'bg-transparent'
-      }`}
+      } ${className}`}
     >
-      <div className="w-[90%] max-w-7xl mx-auto h-20 flex items-center justify-between">
-        {/* Logo */}
-        <button
-          onClick={() => onViewChange('library')}
-          className="flex items-center gap-3 group"
-        >
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#e5a349] to-[#d49340] flex items-center justify-center transform group-hover:scale-110 transition-transform duration-300">
-            <BookOpen className="w-5 h-5 text-white" />
-          </div>
-          <span className="text-xl font-bold text-white tracking-tight">
-            Lingua<span className="text-[#e5a349]">Reader</span>
-          </span>
-        </button>
+      <div className="w-[90%] max-w-7xl mx-auto h-20 flex items-center justify-between pr-14 md:pr-16">
+        {/* Logo — 书架展开时隐藏，收起/非图书馆视图时显示 */}
+        {showLogo ? (
+          <button
+            onClick={() => onViewChange('library')}
+            className="flex items-center gap-3 group"
+          >
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#e5a349] to-[#d49340] flex items-center justify-center transform group-hover:scale-110 transition-transform duration-300">
+              <BookOpen className="w-5 h-5 text-white" />
+            </div>
+            <span className="text-xl font-bold text-white tracking-tight">
+              Lingua<span className="text-[#e5a349]">Reader</span>
+            </span>
+          </button>
+        ) : (
+          <div />
+        )}
 
         {/* Desktop Navigation */}
         <div className="hidden md:flex items-center gap-2">

@@ -2,10 +2,15 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, memo } from 
 import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { HighlightDB } from '@/lib/db';
+import { fileDataToArrayBuffer } from '@/lib/fileParser';
 import { ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { WordMarker } from '@/types';
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+// pdf.js v5 主入口导出 TextLayer，但类型声明可能缺失，故用 any 取用。
+// TextLayer 渲染一个透明 DOM 文字层（与 Canvas 文字像素对齐），用于 CSS Custom Highlight API 精确染色。
+const TextLayerCtor = (pdfjs as any).TextLayer;
 
 interface WordBox {
   text: string;
@@ -14,6 +19,13 @@ interface WordBox {
   w: number;
   h: number;
   sentence: string;
+  // 映射桥：本 WordBox 由 buildBoxes 从 textContent items 切出，itemIdx 指向其在
+  // "含 str 的 textContent item" 中的下标（含空串也计槽位），与 pdf.js TextLayer 的
+  // textDivs 数组下标严格对齐。rawStart/rawEnd 是该词在 item 原始 str 中的字符偏移，
+  // 用于通过 CSS Custom Highlight API 精确染色（零 side-bearing 缝隙）。
+  itemIdx: number;
+  rawStart: number;
+  rawEnd: number;
 }
 
 interface HlEntry {
@@ -29,7 +41,7 @@ interface LinkAnnotation {
 }
 
 interface PDFCanvasViewerProps {
-  fileData: string;
+  fileData: string | Blob;
   pageNum: number;
   bookId?: string;
   chapterIndex?: number;
@@ -45,8 +57,21 @@ interface PDFCanvasViewerProps {
 const MIN_SCALE = 0.3;
 const MAX_SCALE = 4.0;
 
+// 连字符字符集（含 ASCII 连字符与常见 Unicode 连字符/破折号）。用于换行断词续接判断，
+// 避免 "well-" + "known" 因字符集不全而无法接成 "well-known"。
+// 注意：U+00AD 软连字符已被 clean() 删除，无需列入；U+2011 非断 hyphen 落在 2010-2015 区间内。
+const HYPHEN_RE = /[-֊‐-―⸗⸚゠﹘﹣－]/;
+
 function clean(str: string): string {
   return str.replace(/[\u00AD\u200B-\u200F\u2060\uFEFF]/g, '');
+}
+
+/**
+ * 归一化用于"标记命中"比较：转小写并去掉所有标点/符号（含连字符、撇号、破折号等）。
+ * 这样已标记词 "well-known" 能与 PDF 中因换行断词拆出的 "well-" / "known" 命中同一标记。
+ */
+function normMatch(str: string): string {
+  return str.toLowerCase().replace(/[\p{P}\p{S}]/gu, '');
 }
 
 /**
@@ -72,9 +97,11 @@ function isSameLine(a: WordBox, b: WordBox): boolean {
 function wordOverflow(h: number): { padLeft: number; padTop: number; padW: number; padH: number } {
   const base = Math.max(6, h);
   return {
-    padLeft: Math.max(1, Math.round(base * 0.08)),   // 左溢出 ~1px (防溢出到前一个词)
+    // 左右按比例补偿字形"侧边空白"(side bearing)：墨迹常略微超出 pdf.js 的排版占位宽度，
+    // 左/右各补 ~0.14~0.16 字号，避免 "部分单词在高亮之外"。值偏小以防溢出到相邻词。
+    padLeft: Math.max(2, Math.round(base * 0.14)),   // 左溢出 ~2-3px (盖住左 side bearing，如 J/T/引号)
     padTop:  Math.max(4, Math.round(base * 0.55)),   // 上溢出 ~4-8px (盖住 ascender)
-    padW:    Math.max(3, Math.round(base * 0.28)),   // 宽度增量 ~3-5px (防溢出到后一个词)
+    padW:    Math.max(6, Math.round(base * 0.30)),   // 宽度增量 ~6-9px（其中右溢出≈padW-padLeft，盖住末字右 side bearing）
     padH:    Math.max(9, Math.round(base * 0.90)),   // 高度增量 ~9-13px (盖住 descender)
   };
 }
@@ -121,8 +148,9 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
   // Sync marked words from props into ref
   // 不在此处调用 drawAllOverlays——下面的"高亮/标记变化" useLayoutEffect 会负责重绘，
   // 避免在 effect 阶段先重绘一次、再在 layout effect 阶段再重绘一次（双重开销）。
+  // 注意：用 normMatch 归一化（去标点/连字符），使 "well-known" 能与 PDF 中断行拆出的词命中。
   useEffect(() => {
-    markedSetRef.current = new Set((wordMarkers || []).map(w => w.word.toLowerCase()));
+    markedSetRef.current = new Set((wordMarkers || []).map(w => normMatch(w.word)));
   }, [wordMarkers]);
 
   // Load saved highlights from DB into ref
@@ -170,14 +198,12 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     hlEntriesRef.current = [];
     selRangeRef.current = null;
     if (overlayContainerRef.current) overlayContainerRef.current.innerHTML = '';
+    if (textLayerContainerRef.current) textLayerContainerRef.current.textContent = '';
+    textSpansRef.current = [];
 
     (async () => {
       try {
-        let base64 = fileData;
-        if (fileData.includes(',')) base64 = fileData.split(',')[1];
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const bytes = new Uint8Array(await fileDataToArrayBuffer(fileData));
         let pdf: pdfjs.PDFDocumentProxy | undefined;
         try {
           pdf = await pdfjs.getDocument({ data: bytes }).promise;
@@ -266,6 +292,24 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
           if (cancelled || generation !== renderGenerationRef.current) return;
           const items = tc?.items || [];
           const builtWords = buildBoxes(items, viewport);
+
+          // 渲染真实文字层（pdf.js TextLayer）——透明 DOM 文字，仅作 CSS Custom Highlight API 的染色载体，
+          // 文字由底层 Canvas 显示，从根本上达到"高亮紧贴字形、零 side-bearing 缝隙"（Koodo 效果）。
+          try {
+            if (textLayerContainerRef.current) {
+              textLayerContainerRef.current.textContent = '';
+              // 设置 pdf.js TextLayer 需要的 CSS 缩放变量；缺少它时 font-size/width/height
+              // 的 calc() 会失效，导致文字层 span 错位或缩成 0，高亮就会飘到奇怪位置。
+              textLayerContainerRef.current.style.setProperty('--scale-factor', String(scale));
+              const tl = new TextLayerCtor({ textContentSource: tc, container: textLayerContainerRef.current, viewport });
+              textLayerRef.current = tl;
+              await tl.render();
+              if (cancelled || generation !== renderGenerationRef.current) return;
+              textSpansRef.current = (tl.textDivs || []) as HTMLElement[];
+            }
+          } catch (e) {
+            textSpansRef.current = [];
+          }
           // Re-match highlights with new words
           let entries: HlEntry[] = [];
           if (bookId) {
@@ -328,22 +372,159 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
   // 所有绘制都通过 drawAllOverlays() 命令式完成——单一代码路径，无竞态、无"闪白"。
   const overlayContainerRef = useRef<HTMLDivElement>(null);
 
+  // 真实文字层容器（pdf.js TextLayer 写入 span）。pointer-events:none、color:transparent，
+  // 仅作为 CSS Custom Highlight API 的染色载体，文字由底层 Canvas 显示，避免重影。
+  const textLayerContainerRef = useRef<HTMLDivElement>(null);
+  const textLayerRef = useRef<any>(null);
+  const textSpansRef = useRef<HTMLElement[]>([]);
+
+  /**
+   * 把 WordBox 映射为 CSS Custom Highlight API 用的字符级 Range。
+   * 通过 buildBoxes 记录的 itemIdx（对齐 TextLayer.textDivs）定位 span，
+   * 再用 rawStart/rawEnd（基于 item 原始 str，与 span.textContent 一致）截取精确字符范围。
+   * 渲染层文字透明由 Canvas 显示，故高亮背景紧贴字形、零 side-bearing 缝隙（Koodo 效果）。
+   */
+  const wordIndexToRange = useCallback((wb: WordBox): Range | null => {
+    const spans = textSpansRef.current;
+    if (!spans || wb.itemIdx < 0 || wb.itemIdx >= spans.length) return null;
+    const span = spans[wb.itemIdx];
+    if (!span) return null;
+    const first = span.firstChild;
+    if (!first || first.nodeType !== 3) return null; // 期望首个子节点是文本节点
+    const tn = first as Text;
+    const len = tn.length;
+    let s = wb.rawStart;
+    let e = wb.rawEnd;
+    if (s < 0 || e > len || s >= e) {
+      // 容错：若 TextLayer 文本与 rawStr 不一致导致越界，尝试在文本节点中定位清洗后的词
+      const idx = tn.data.indexOf(wb.text);
+      if (idx >= 0) { s = idx; e = idx + wb.text.length; }
+      else return null;
+    }
+    try {
+      const r = new Range();
+      r.setStart(tn, s);
+      r.setEnd(tn, e);
+      return r;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const drawAllOverlays = useCallback(() => {
     const container = overlayContainerRef.current;
     if (!container) return;
     const words = wordsRef.current;
-    // When words are empty (page is rendering), do NOT clear the container.
-    if (!words || words.length === 0) { return; }
-
-    // Build HTML string for all overlays (single innerHTML call = single reflow)
-    const parts: string[] = [];
+    if (!words || words.length === 0) return;
     const marked = markedSetRef.current;
     const hlEntries = hlEntriesRef.current;
 
-    /**
-     * 将索引数组按「连续序号 + 同行」合并为段，每段调用 render(firstWord, lastWord) 生成一个覆盖块。
-     * 这是解决"高亮断裂"和"下划线切断"的关键：同行相邻单词合并为一个连续矩形/线条。
-     */
+    // 连字符续词归一化键：若词以连字符结尾，把后续词拼接，使 "well-" / "known" 整链命中 "well-known"
+    const compoundNorm: string[] = new Array(words.length);
+    for (let i = 0; i < words.length; i++) {
+      let j = i;
+      let txt = words[i].text;
+      while (j + 1 < words.length && HYPHEN_RE.test(words[j].text.slice(-1))) {
+        j++;
+        txt += words[j].text;
+      }
+      compoundNorm[i] = normMatch(txt);
+    }
+
+    // 生词标记索引（跳过已被 DB 高亮覆盖的词）
+    const covered = new Set<number>();
+    for (const entry of hlEntries) {
+      for (let i = entry.range[0]; i <= entry.range[1] && i < words.length; i++) covered.add(i);
+    }
+    const markedIndices: number[] = [];
+    for (let i = 0; i < words.length; i++) {
+      if (covered.has(i)) continue;
+      if (marked.has(compoundNorm[i])) {
+        let j = i;
+        while (j + 1 < words.length && HYPHEN_RE.test(words[j].text.slice(-1))) j++;
+        for (let k = i; k <= j; k++) if (!covered.has(k)) markedIndices.push(k);
+      }
+    }
+
+    // 把 WordBox 索引区间转为字符级 Range（供 CSS Custom Highlight API 精确染色）
+    const rangesForRange = (s: number, e: number): Range[] => {
+      const out: Range[] = [];
+      for (let i = s; i <= e && i < words.length; i++) {
+        const r = wordIndexToRange(words[i]);
+        if (r) out.push(r);
+      }
+      return out;
+    };
+    const rangesForIndices = (indices: number[]): Range[] => {
+      const out: Range[] = [];
+      for (const i of indices) {
+        const r = wordIndexToRange(words[i]);
+        if (r) out.push(r);
+      }
+      return out;
+    };
+
+    // 链接点击区域（两种模式都需写入 overlay 容器，pointer-events:auto）
+    const viewport = viewportRef.current;
+    const links = linkAnnotationsRef.current;
+    const linkParts: string[] = [];
+    if (viewport && links && links.length > 0) {
+      for (let i = 0; i < links.length; i++) {
+        const link = links[i];
+        const [x1, y1, x2, y2] = link.rect;
+        const pt1 = viewport.convertToViewportPoint(x1, y1);
+        const pt2 = viewport.convertToViewportPoint(x2, y2);
+        const left = Math.min(pt1[0], pt2[0]);
+        const top = Math.min(pt1[1], pt2[1]);
+        const width = Math.max(2, Math.abs(pt2[0] - pt1[0]));
+        const height = Math.max(2, Math.abs(pt2[1] - pt1[1]));
+        linkParts.push(`<div class="pdf-link-area" data-link-idx="${i}" style="position:absolute;left:${left}px;top:${top}px;width:${width}px;height:${height}px;z-index:10;cursor:pointer;pointer-events:auto;background:rgba(0,0,0,0);border-radius:2px;"></div>`);
+      }
+    }
+
+    const CSSany = (window as any).CSS;
+    const supportsHighlight = !!CSSany && !!CSSany.highlights;
+    // 仅当 TextLayer 真正渲染出 span（textSpansRef 非空）时才走 Highlight 路径；
+    // 否则（TextLayer 未渲染/异常）退回坐标矩形兜底，确保高亮绝不会"整体消失"。
+    const useHighlight = supportsHighlight && textSpansRef.current.length > 0;
+    if (typeof window !== 'undefined' && (window as any).__pdfDebug !== false) {
+      console.log('[PDF overlay] words=%d spans=%d CSS.highlights=%s useHighlight=%s', words.length, textSpansRef.current.length, supportsHighlight, useHighlight);
+    }
+    if (useHighlight) {
+      // 先清旧高亮，杜绝翻页/缩放残留
+      CSSany.highlights.delete('pdf-hl');
+      CSSany.highlights.delete('pdf-ul');
+      CSSany.highlights.delete('pdf-mark');
+      CSSany.highlights.delete('pdf-sel');
+    }
+
+    if (useHighlight) {
+      // ── 路线 B：CSS Custom Highlight API 精确染色（零 side-bearing 缝隙，Koodo 效果）──
+      const hlRanges: Range[] = [];
+      const ulRanges: Range[] = [];
+      for (const entry of hlEntries) {
+        const ranges = rangesForRange(entry.range[0], entry.range[1]);
+        if (entry.type === 'underline') ulRanges.push(...ranges);
+        else hlRanges.push(...ranges);
+      }
+      const markRanges = rangesForIndices(markedIndices);
+      const sel = selRangeRef.current;
+      const selRanges = sel ? rangesForRange(sel[0], sel[1]) : [];
+      const HighlightCtor = (window as any).Highlight;
+      CSSany.highlights.set('pdf-hl', new HighlightCtor(...hlRanges));
+      CSSany.highlights.set('pdf-ul', new HighlightCtor(...ulRanges));
+      CSSany.highlights.set('pdf-mark', new HighlightCtor(...markRanges));
+      CSSany.highlights.set('pdf-sel', new HighlightCtor(...selRanges));
+      if (typeof window !== 'undefined' && (window as any).__pdfDebug !== false) {
+        console.log('[PDF overlay] highlight ranges: hl=%d ul=%d mark=%d sel=%d', hlRanges.length, ulRanges.length, markRanges.length, selRanges.length);
+      }
+      // 链接区域仍需写入 overlay（高亮背景由 CSS.highlights 显示，不依赖 DOM 结构）
+      container.innerHTML = linkParts.join('');
+      return;
+    }
+
+    // ── Fallback：不支持 Highlight API 时，退回原坐标覆盖层矩形 ──
+    const parts: string[] = [];
     function pushMergedSegments(
       indices: number[],
       render: (first: WordBox, last: WordBox) => string,
@@ -353,7 +534,6 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       for (let i = 0; i < indices.length; i++) {
         const cur = indices[i];
         const next = indices[i + 1];
-        // 分组边界：索引不连续 或 不在同一行
         const endOfGroup =
           next === undefined ||
           next !== cur + 1 ||
@@ -364,14 +544,10 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         }
       }
     }
-
-    // ── DB highlights & underlines ──
     for (const entry of hlEntries) {
       const [s, e] = entry.range;
-      // 收集当前高亮范围内的所有单词索引
       const indices: number[] = [];
       for (let i = s; i <= e && i < words.length; i++) indices.push(i);
-
       if (entry.type === 'underline') {
         pushMergedSegments(indices, (first, last) => {
           const ov = wordOverflow(last.h);
@@ -391,18 +567,6 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         });
       }
     }
-
-    // ── Marked words（生词标记，跳过已被高亮覆盖的）──
-    const covered = new Set<number>();
-    for (const entry of hlEntries) {
-      for (let i = entry.range[0]; i <= entry.range[1] && i < words.length; i++) covered.add(i);
-    }
-    const markedIndices: number[] = [];
-    for (let i = 0; i < words.length; i++) {
-      if (!covered.has(i) && marked.has(words[i].text.toLowerCase())) {
-        markedIndices.push(i);
-      }
-    }
     pushMergedSegments(markedIndices, (first, last) => {
       const ov = wordOverflow(last.h);
       const top = Math.round(first.y - ov.padTop);
@@ -411,8 +575,6 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       const height = Math.max(6, Math.round(last.y + last.h - first.y) + ov.padH);
       return `<div style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(229,163,73,0.40);border-radius:2px;z-index:1;"></div>`;
     });
-
-    // ── 当前拖拽选中 ──
     const sel = selRangeRef.current;
     if (sel) {
       const selIndices: number[] = [];
@@ -426,24 +588,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         return `<div data-sel-overlay="1" style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(229,163,73,0.25);border-radius:2px;z-index:3;"></div>`;
       });
     }
-
-    // ── Link annotations（PDF 内部跳转 / 外部链接点击区域）──
-    const viewport = viewportRef.current;
-    const links = linkAnnotationsRef.current;
-    if (viewport && links && links.length > 0) {
-      for (let i = 0; i < links.length; i++) {
-        const link = links[i];
-        const [x1, y1, x2, y2] = link.rect;
-        const pt1 = viewport.convertToViewportPoint(x1, y1);
-        const pt2 = viewport.convertToViewportPoint(x2, y2);
-        const left = Math.min(pt1[0], pt2[0]);
-        const top = Math.min(pt1[1], pt2[1]);
-        const width = Math.max(2, Math.abs(pt2[0] - pt1[0]));
-        const height = Math.max(2, Math.abs(pt2[1] - pt1[1]));
-        parts.push(`<div class="pdf-link-area" data-link-idx="${i}" style="position:absolute;left:${left}px;top:${top}px;width:${width}px;height:${height}px;z-index:10;cursor:pointer;pointer-events:auto;background:rgba(0,0,0,0);border-radius:2px;"></div>`);
-      }
-    }
-
+    parts.push(...linkParts);
     container.innerHTML = parts.join('');
   }, []);
 
@@ -536,22 +681,44 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
   //   - mouseup（结束选择，需要清掉高亮指示）
   //   - 翻页/缩放/高亮数据变化
   const renderSelOnly = useCallback(() => {
+    const CSSany = (window as any).CSS;
+    const supportsHighlight = !!CSSany && !!CSSany.highlights;
+    const useHighlight = supportsHighlight && textSpansRef.current.length > 0;
+    const words = wordsRef.current;
+    if (!words || words.length === 0) {
+      if (!supportsHighlight) {
+        const c = overlayContainerRef.current;
+        if (c) c.querySelectorAll('[data-sel-overlay]').forEach((n: any) => n.remove());
+      }
+      return;
+    }
+    const sel = selRangeRef.current;
+
+    if (useHighlight) {
+      // 仅重建 pdf-sel，不影响已设的 hl/mark 高亮（性能优于全量重绘）
+      CSSany.highlights.delete('pdf-sel');
+      if (sel) {
+        const ranges: Range[] = [];
+        for (let i = sel[0]; i <= sel[1] && i < words.length; i++) {
+          const r = wordIndexToRange(words[i]);
+          if (r) ranges.push(r);
+        }
+        CSSany.highlights.set('pdf-sel', new (window as any).Highlight(...ranges));
+      }
+      return;
+    }
+
+    // Fallback：原矩形 div 逻辑
     const container = overlayContainerRef.current;
     if (!container) return;
-    const words = wordsRef.current;
-    if (!words || words.length === 0) return;
-    const sel = selRangeRef.current;
-    // 删除所有旧的选中段
     const olds = container.querySelectorAll('[data-sel-overlay]');
-    for (let i = 0; i < olds.length; i++) {
-      olds[i].remove();
-    }
+    for (let i = 0; i < olds.length; i++) olds[i].remove();
     if (!sel) return;
     const [s, e] = sel;
     if (s < 0 || e >= words.length) return;
-    let groupStart = 0;
     const selIndices: number[] = [];
     for (let i = s; i <= e; i++) selIndices.push(i);
+    let groupStart = 0;
     for (let i = 0; i < selIndices.length; i++) {
       const cur = selIndices[i];
       const next = selIndices[i + 1];
@@ -761,6 +928,9 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     >
       <div ref={containerRef} className="relative inline-block">
         <canvas ref={canvasRef} className="block shadow-lg" style={{ cursor: 'text' }} />
+        {/* 真实文字层（pdf.js TextLayer）：透明 DOM 文字，仅作 CSS Custom Highlight API 的染色载体，
+            文字由底层 Canvas 显示，避免重影；pointer-events:none 让命中走外层 handler。 */}
+        <div ref={textLayerContainerRef} className="pdf-text-layer absolute inset-0 pointer-events-none" style={{ userSelect: 'none' }} />
         {/* 覆盖层：无 JSX 子节点，absolute inset-0 相对 canvas 外层对齐词坐标；
             pointer-events-none 让鼠标事件穿透到 canvas，由 outerRef 的 handler 处理。
             user-select:none 阻止浏览器原生蓝色 selection 出现——这是"涂橙"的真凶之一。 */}
@@ -800,14 +970,18 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
 // ===== Build word boxes =====
 function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
   const words: WordBox[] = [];
-  const textItems: Array<{ rawStr: string; cleanStr: string; transform: number[]; width: number; charWidths?: number[] }> = [];
+  const textItems: Array<{ rawStr: string; cleanStr: string; transform: number[]; width: number; charWidths?: number[]; spanIdx: number }> = [];
 
+  // spanIndex 须与 pdf.js TextLayer 的 textDivs 严格对齐：TextLayer 为每个"含 str 的
+  // textContent item"（含空串 str）生成一个 span，故此处凡 typeof item.str==='string' 都计一个槽位。
+  let spanIndex = 0;
   for (const item of items) {
-    if (!item || typeof item.str !== 'string' || !item.transform) continue;
+    if (!item || typeof item.str !== 'string') continue;
+    const itemSpanIdx = spanIndex++;
     const rawStr = item.str;
     const cleanStr = clean(rawStr);
-    if (!cleanStr) continue;
-    textItems.push({ rawStr, cleanStr, transform: item.transform, width: item.width || 0, charWidths: item.chars || item.charWidths });
+    if (!cleanStr || !item.transform) continue; // 不产 WordBox，但槽位已计入以保持对齐
+    textItems.push({ rawStr, cleanStr, transform: item.transform, width: item.width || 0, charWidths: item.chars || item.charWidths, spanIdx: itemSpanIdx });
   }
   if (textItems.length === 0) return [];
 
@@ -820,10 +994,17 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
     if (fontH <= 0) continue;
 
     const wordMatches = [...item.cleanStr.matchAll(/[^\s\p{P}\p{S}]+(?:[-'\u2010-\u2015][^\s\p{P}\p{S}]+)*/gu)];
+    // 换行断词：pdf.js 把 "well-" + "known" 拆成两个 text item（前半 item 以连字符结尾）。
+    // 若不保留连字符，前半词会变成 "well"，compoundNorm 的续词判断（/[-]$/）失效，
+    // 两段永远接不成 "well-known"，标记/高亮就整体丢失。这里把 item 末尾的连字符并入前半词。
+    const itemEndsWithHyphen = HYPHEN_RE.test(item.rawStr.slice(-1));
     for (const match of wordMatches) {
-      const word = match[0];
+      const rawWord = match[0];
       const cleanStart = match.index!;
-      const cleanEnd = cleanStart + word.length;
+      const cleanEnd = cleanStart + rawWord.length;
+
+      // 连字符续词：前半词补回连字符（同词 "well-known" 正则已含连字符，此处不会重复补）
+      const word = itemEndsWithHyphen && !HYPHEN_RE.test(rawWord.slice(-1)) ? rawWord + item.rawStr.slice(cleanEnd).match(HYPHEN_RE)?.[0] || '-' : rawWord;
 
       let cleanPos = 0, rawStart = -1, rawEnd = item.rawStr.length;
       for (let ri = 0; ri < item.rawStr.length; ri++) {
@@ -832,6 +1013,8 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
         if (cleanPos === cleanEnd) { rawEnd = ri + 1; break; }
       }
       if (rawStart < 0) rawStart = 0;
+      // 续词连字符也算进高亮范围（盖住那个连字符字形）
+      if (itemEndsWithHyphen) rawEnd = item.rawStr.length;
 
       let prefixWidth = 0, wordWidth = 0;
       const totalScaledWidth = item.width * viewport.scale;
@@ -867,6 +1050,9 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
         w: wordWidth,
         h: ascent + descent,
         sentence: '', // 留空，选中时动态提取
+        itemIdx: item.spanIdx,
+        rawStart,
+        rawEnd,
       });
     }
   }

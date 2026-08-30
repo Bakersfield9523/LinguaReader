@@ -28,7 +28,7 @@ export interface Book {
   cover?: string;
   language: Language;
   format: 'epub' | 'pdf' | 'txt';
-  fileData: string; // base64 encoded file data for IndexedDB compatibility
+  fileData: string | Blob; // 新书籍存 Blob（IndexedDB 原生支持，无 base64 膨胀）；旧书仍为 base64 字符串（打开时自动迁移）
   fileType: string;
   createdAt: number;
   lastReadAt?: number;
@@ -83,6 +83,7 @@ export interface WordMarker {
 // 词典定义类型
 export interface DictionaryDefinition {
   word: string;
+  lemma?: string; // 词形还原后的原形（如 running -> run），用于提示用户
   phonetic?: string;
   ukPhonetic?: string;
   usPhonetic?: string;
