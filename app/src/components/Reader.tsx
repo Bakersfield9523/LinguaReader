@@ -436,7 +436,8 @@ export function Reader({
       fontSize: 18,
       lineHeight: 1.8,
       theme: 'light',
-      fontFamily: 'Georgia, serif'
+      fontFamily: 'Georgia, serif',
+      readerMode: 'scroll'
     };
   });
   // 设置变更时持久化到 localStorage
@@ -470,6 +471,15 @@ export function Reader({
   // 用 ref 保存 currentChapter 避免 handleScroll 重建
   const currentChapterRef = useRef(currentChapter);
   currentChapterRef.current = currentChapter;
+
+  // 翻页模式状态
+  const [currentPage, setCurrentPage] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const pageModeRef = useRef(settings.readerMode === 'page');
+  pageModeRef.current = settings.readerMode === 'page';
+  const pageContentRef = useRef<HTMLDivElement>(null);
+  // 翻页模式下是否已恢复过初始页码（避免章节切换时反复跳回旧位置）
+  const pageRestoredRef = useRef(false);
 
   // 高亮/下划线
   const [highlights, setHighlights] = useState<Highlight[]>([]);
@@ -796,8 +806,8 @@ export function Reader({
     const f = iframeRef.current;
     const doc = f && f.contentDocument;
     if (!doc || !doc.body) return;
-    iframeApplySettings(doc, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme });
-  }, [settings.fontSize, settings.lineHeight, settings.theme]);
+    iframeApplySettings(doc, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, readerMode: settings.readerMode });
+  }, [settings.fontSize, settings.lineHeight, settings.theme, settings.readerMode]);
 
   // 滚动位置保存（防抖，500ms）
   // PDF 模式下不处理滚动（PDF 用翻页而非滚动）
@@ -806,8 +816,13 @@ export function Reader({
     if (epubRenderMode === 'iframe' && book.format === 'epub') {
       const f = iframeRef.current;
       if (!f || !f.contentWindow) return;
-      const el = f.contentWindow.document.scrollingElement || f.contentWindow.document.body;
-      const scrollPercent = el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
+      const doc = f.contentWindow.document;
+      // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），故用 doc.body；否则用 documentElement
+      const el = settings.readerMode === 'page' ? doc.body : (doc.scrollingElement || doc.body);
+      // 翻页模式为横向滚动，按 scrollLeft 计算章节内百分比；否则按 scrollTop
+      const scrollPercent = settings.readerMode === 'page'
+        ? el.scrollLeft / Math.max(1, el.scrollWidth - el.clientWidth)
+        : el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
       scrollPosRef.current = Math.round(scrollPercent * 100);
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
       scrollSaveTimerRef.current = setTimeout(() => {
@@ -831,6 +846,8 @@ export function Reader({
   // 恢复滚动位置（只在 EPUB/TXT 非 iframe 模式下，且只执行一次）
   const restoreScrollPosition = useCallback(() => {
     if (book.format === 'pdf') return;
+    // 翻页模式下进度以页码形式恢复（见下方章节切换 effect），不走 scrollTop
+    if (settings.readerMode === 'page') return;
     // EPUB iframe 模式的滚动发生在 iframe 内部文档，恢复逻辑在 handleIframeLoad 中处理
     if (book.format === 'epub' && epubRenderMode === 'iframe') return;
     if (scrollRestoredRef.current) return;
@@ -859,6 +876,135 @@ export function Reader({
   useEffect(() => {
     scrollRestoredRef.current = false;
   }, [currentChapter]);
+
+  // ================= 翻页模式（page mode）核心逻辑 =================
+  // 测量滚动容器与总页数：横向 CSS columns 下 scrollWidth / clientWidth
+  const measurePages = useCallback((): { el: HTMLElement | null; pages: number } => {
+    if (book.format === 'pdf') return { el: null, pages: 1 };
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      const f = iframeRef.current;
+      if (!f || !f.contentWindow) return { el: null, pages: 1 };
+      const doc = f.contentWindow.document;
+      // 翻页模式下 body 才是带 overflow:hidden 的横向多列滚动容器（不是 documentElement），
+      // 必须用 doc.body 测量/滚动，否则 window.scrollTo 因 documentElement 无横向溢出而失效。
+      const width = doc.body.clientWidth || f.clientWidth;
+      const scrollWidth = doc.body.scrollWidth;
+      const pages = Math.max(1, Math.round(scrollWidth / Math.max(1, width)));
+      return { el: doc.body, pages };
+    }
+    const el = pageContentRef.current;
+    if (!el) return { el: null, pages: 1 };
+    const width = el.clientWidth;
+    const scrollWidth = el.scrollWidth;
+    const pages = Math.max(1, Math.round(scrollWidth / Math.max(1, width)));
+    return { el, pages };
+  }, [book.format, epubRenderMode]);
+
+  const updateTotalPages = useCallback(() => {
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const { pages } = measurePages();
+    setTotalPages(pages);
+  }, [settings.readerMode, book.format, measurePages]);
+
+  // 翻页模式下按章节内页码保存进度（复用 scrollPosition 字段存章节内百分比）
+  const savePageProgress = useCallback((page: number, pages: number) => {
+    const pos = pages > 1 ? Math.round((page / (pages - 1)) * 100) : 0;
+    scrollPosRef.current = pos;
+    onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, pos);
+  }, [book.id, onUpdateProgress]);
+
+  // 跳转到指定页（0-based）
+  const goToPage = useCallback((pageIndex: number) => {
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const { el, pages } = measurePages();
+    const clamped = Math.max(0, Math.min(pageIndex, Math.max(0, pages - 1)));
+    setCurrentPage(clamped);
+    if (epubRenderMode === 'iframe' && book.format === 'epub') {
+      const f = iframeRef.current;
+      if (!f || !f.contentWindow) return;
+      const doc = f.contentWindow.document;
+      // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），而非 window/documentElement
+      doc.body.scrollTo({ left: clamped * (doc.body.clientWidth || f.clientWidth), behavior: 'smooth' });
+    } else if (el) {
+      el.scrollTo({ left: clamped * el.clientWidth, behavior: 'smooth' });
+    }
+    savePageProgress(clamped, pages);
+  }, [settings.readerMode, book.format, epubRenderMode, measurePages, savePageProgress]);
+
+  const nextPage = useCallback(() => {
+    if (currentPage >= totalPages - 1) {
+      // 最后一页：进入下一章（如果有）
+      if (currentChapter < flatChapters.length - 1) {
+        changeChapter(currentChapter + 1);
+      }
+      return;
+    }
+    goToPage(currentPage + 1);
+  }, [currentPage, totalPages, currentChapter, flatChapters.length, goToPage, changeChapter]);
+
+  const prevPage = useCallback(() => {
+    if (currentPage <= 0) {
+      // 第一页：回到上一章末尾（如果有）
+      if (currentChapter > 0) {
+        changeChapter(currentChapter - 1);
+      }
+      return;
+    }
+    goToPage(currentPage - 1);
+  }, [currentPage, currentChapter, goToPage, changeChapter]);
+
+  // 键盘翻页
+  useEffect(() => {
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
+        e.preventDefault();
+        nextPage();
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'PageUp') {
+        e.preventDefault();
+        prevPage();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [settings.readerMode, book.format, nextPage, prevPage]);
+
+  // 章节切换时重置到第 0 页；内容/窗口尺寸变化后重新测量页数；初次打开时恢复上次页码
+  useEffect(() => {
+    setCurrentPage(0);
+    // 延迟测量，等待渲染完成
+    const t1 = setTimeout(() => {
+      updateTotalPages();
+      // 初次打开（仅一次）根据保存的章节内百分比恢复页码
+      if (!pageRestoredRef.current && pendingRestorePosRef.current > 0) {
+        const { el, pages } = measurePages();
+        const page = Math.min(
+          Math.max(0, pages - 1),
+          Math.round((pendingRestorePosRef.current / 100) * Math.max(0, pages - 1))
+        );
+        if (page > 0) {
+          setCurrentPage(page);
+          if (epubRenderMode === 'iframe' && book.format === 'epub') {
+            const f = iframeRef.current;
+            if (f?.contentWindow) f.contentWindow.document.body.scrollTo({ left: page * (f.contentWindow.document.body.clientWidth || f.clientWidth) });
+          } else if (el) {
+            el.scrollTo({ left: page * el.clientWidth });
+          }
+        }
+        pageRestoredRef.current = true;
+      }
+    }, 150);
+    const t2 = setTimeout(() => updateTotalPages(), 600);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [currentChapter, chapterContent, settings.readerMode, updateTotalPages, measurePages]);
+
+  useEffect(() => {
+    const handleResize = () => { updateTotalPages(); };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [updateTotalPages]);
 
   // 用 ref 保存关键 state，避免 onClick 闭包引用过期值
   const flatChaptersRef = useRef(flatChapters);
@@ -1493,6 +1639,7 @@ export function Reader({
       fontSize: settings.fontSize,
       lineHeight: settings.lineHeight,
       theme: settings.theme,
+      readerMode: settings.readerMode,
     }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })));
     // 绑定交互事件（在 iframe 文档上，绕开 CSP 内联脚本限制）
     doc.body.addEventListener('click', onIframeClick as EventListener);
@@ -1514,12 +1661,22 @@ export function Reader({
     }
     if (savedPos > 0) {
       requestAnimationFrame(() => {
-        const scEl = doc.scrollingElement || doc.body;
-        const max = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
-        scEl.scrollTop = (savedPos / 100) * max;
+        // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），故用它恢复横向位置
+        const scEl = settings.readerMode === 'page' ? doc.body : (doc.scrollingElement || doc.body);
+        if (settings.readerMode === 'page') {
+          const max = Math.max(1, scEl.scrollWidth - scEl.clientWidth);
+          scEl.scrollLeft = (savedPos / 100) * max;
+        } else {
+          const max = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
+          scEl.scrollTop = (savedPos / 100) * max;
+        }
       });
     }
-  }, [settings.fontSize, settings.lineHeight, settings.theme, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup, handleScroll]);
+    // 翻页模式下文档布局完成后再测量一次总页数（onLoad 时列布局可能尚未稳定）
+    if (settings.readerMode === 'page') {
+      setTimeout(() => updateTotalPages(), 200);
+    }
+  }, [settings.fontSize, settings.lineHeight, settings.theme, settings.readerMode, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup, handleScroll, updateTotalPages]);
 
   // 渲染内容区域 — 普通函数，不需要 useCallback（每次渲染直接调用）
   const renderContent = () => {
@@ -1578,6 +1735,7 @@ export function Reader({
       fontSize: settings.fontSize,
       lineHeight: settings.lineHeight,
       theme: settings.theme,
+      readerMode: settings.readerMode,
     });
   }, [book.format, epubRenderMode, chapterContent, bookCss]);
 
@@ -1805,6 +1963,35 @@ export function Reader({
                   <Moon className="w-4 h-4" />
                 </button>
               </div>
+
+              {/* 阅读模式：滑动 / 翻页 */}
+              <div className="flex items-center gap-2">
+                <span className="text-sm opacity-80">翻页</span>
+                <div className="flex items-center bg-current/5 rounded-lg p-0.5 border border-current/10">
+                  <button
+                    onClick={() => setSettings(s => ({ ...s, readerMode: 'scroll' }))}
+                    className={`px-3 py-1.5 rounded-md text-sm transition-colors ${
+                      settings.readerMode !== 'page'
+                        ? 'bg-[#e5a349] text-white shadow-sm'
+                        : 'text-current/70 hover:bg-current/10'
+                    }`}
+                    title="连续滑动"
+                  >
+                    滑动
+                  </button>
+                  <button
+                    onClick={() => setSettings(s => ({ ...s, readerMode: 'page' }))}
+                    className={`px-3 py-1.5 rounded-md text-sm transition-colors ${
+                      settings.readerMode === 'page'
+                        ? 'bg-[#e5a349] text-white shadow-sm'
+                        : 'text-current/70 hover:bg-current/10'
+                    }`}
+                    title="分页翻页"
+                  >
+                    翻页
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1975,8 +2162,8 @@ export function Reader({
         <main
           ref={contentRef}
           onScroll={book.format === 'pdf' ? undefined : handleScroll}
-          className={`flex-1 h-[calc(100vh-64px)] ${
-            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe'))
+          className={`flex-1 h-[calc(100vh-64px)] relative ${
+            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe') || settings.readerMode === 'page')
               ? 'overflow-hidden'
               : 'overflow-y-auto'
           } ${showSidebar && book.format !== 'pdf' ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
@@ -1986,7 +2173,8 @@ export function Reader({
               <div className="flex-1 min-h-0">
                 {renderIframeContent()}
               </div>
-              {/* Chapter Navigation Footer */}
+              {/* Chapter Navigation Footer — 翻页模式下改由底部浮动页码条接管 */}
+              {settings.readerMode !== 'page' && (
               <div className="flex items-center justify-between px-6 py-4 border-t border-current/10">
                 <Button
                   variant="ghost"
@@ -2010,15 +2198,33 @@ export function Reader({
                   <ChevronRight className="w-4 h-4" />
                 </Button>
               </div>
+              )}
             </div>
           ) : (
             <div
-              className={book.format === 'pdf' ? '' : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
-              style={book.format === 'pdf' ? undefined : {
-                fontSize: settings.fontSize,
-                lineHeight: settings.lineHeight,
-                fontFamily: settings.fontFamily
-              }}
+              ref={pageContentRef}
+              className={book.format === 'pdf'
+                ? ''
+                : settings.readerMode === 'page'
+                  ? 'h-full w-full reader-page-columns pb-20'
+                  : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
+              style={book.format === 'pdf'
+                ? undefined
+                : settings.readerMode === 'page'
+                  ? {
+                      fontSize: settings.fontSize,
+                      lineHeight: settings.lineHeight,
+                      fontFamily: settings.fontFamily,
+                      columnWidth: '100%',
+                      columnGap: 0,
+                      columnFill: 'auto',
+                      overflow: 'hidden'
+                    }
+                  : {
+                      fontSize: settings.fontSize,
+                      lineHeight: settings.lineHeight,
+                      fontFamily: settings.fontFamily
+                    }}
             >
               {/* Chapter Title (EPUB/TXT only) */}
               {book.format !== 'pdf' && flatChapters[currentChapter] && (
@@ -2032,8 +2238,8 @@ export function Reader({
                 {renderContent()}
               </div>
 
-              {/* Chapter Navigation Footer (EPUB/TXT only) */}
-              {book.format !== 'pdf' && (
+              {/* Chapter Navigation Footer (EPUB/TXT only) — 翻页模式下改由底部浮动页码条接管 */}
+              {book.format !== 'pdf' && settings.readerMode !== 'page' && (
                 <div className="flex items-center justify-between mt-16 pt-8 border-t border-current/10">
                   <Button
                     variant="ghost"
@@ -2060,6 +2266,35 @@ export function Reader({
                   </Button>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* 翻页模式：底部浮动页码导航（滑动/PDF 模式不显示） */}
+          {settings.readerMode === 'page' && book.format !== 'pdf' && (
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 px-2 py-1.5 rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm">
+              <Button
+                variant="ghost"
+                onClick={prevPage}
+                disabled={currentPage <= 0 && currentChapter <= 0}
+                className="text-white hover:bg-white/15 disabled:opacity-30 px-2.5"
+              >
+                <ChevronLeft className="w-4 h-4" />
+                上一页
+              </Button>
+              <span className="text-sm whitespace-nowrap px-1.5 tabular-nums">
+                第 {Math.min(currentPage + 1, totalPages)} / {totalPages} 页
+                <span className="opacity-60 mx-1.5">·</span>
+                第 {currentChapter + 1}/{flatChapters.length} 章
+              </span>
+              <Button
+                variant="ghost"
+                onClick={nextPage}
+                disabled={currentPage >= totalPages - 1 && currentChapter >= flatChapters.length - 1}
+                className="text-white hover:bg-white/15 disabled:opacity-30 px-2.5"
+              >
+                下一页
+                <ChevronRight className="w-4 h-4" />
+              </Button>
             </div>
           )}
         </main>
@@ -2529,6 +2764,19 @@ body { margin: 0; padding: 0; }
   word-wrap: break-word;
   overflow-wrap: break-word;
 }
+/* 翻页模式：横向多列分页，父窗口按 clientWidth 步进滚动 */
+.reader-html-content.reader-page-mode {
+  height: 100vh;
+  max-width: none;
+  margin: 0;
+  /* 仅保留纵向内边距（底部留出浮动页码条空间）；横向必须为 0，
+     否则列宽 = clientWidth - 横向 padding，与按 clientWidth 步进翻页错位 */
+  padding: 2.5rem 0 5rem;
+  overflow: hidden;
+  column-width: 100vw;
+  column-gap: 0;
+  column-fill: auto;
+}
 .reader-theme-light { background: #f5f2e9; color: #2c2c2c; }
 .reader-theme-dark { background: #1a1c1f; color: #e0e0e0; }
 .reader-theme-sepia { background: #f4ecd8; color: #5b4636; }
@@ -2613,13 +2861,13 @@ body { margin: 0; padding: 0; }
 // 逻辑从内联脚本改为父窗口（打包 JS，来源 'self'，不受内联限制）在 iframe onLoad 后
 // 直接操作其 contentDocument，注入样式、绑定事件、应用高亮/标记/脚注，彻底绕开 CSP。
 
-type IframeSettings = { fontSize: number; lineHeight: number; theme: string };
+type IframeSettings = { fontSize: number; lineHeight: number; theme: string; readerMode?: 'scroll' | 'page' };
 type IframeHighlight = { id: string; text: string; note?: string };
 
 function iframeApplySettings(doc: Document, s: IframeSettings) {
   doc.documentElement.style.setProperty('--reader-font', s.fontSize + 'px');
   doc.documentElement.style.setProperty('--reader-line', String(s.lineHeight));
-  doc.body.className = 'reader-html-content reader-theme-' + s.theme;
+  doc.body.className = 'reader-html-content reader-theme-' + s.theme + (s.readerMode === 'page' ? ' reader-page-mode' : '');
 }
 function iframeCleanWord(w: string, isPhrase: boolean): string {
   if (isPhrase) return w.trim().replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
@@ -2777,9 +3025,10 @@ function iframeApplyAll(doc: Document, cleanHtml: string, s: IframeSettings, wor
 function buildSrcDoc(
   content: string,
   bookCss: string,
-  settings: { fontSize: number; lineHeight: number; theme: string },
+  settings: { fontSize: number; lineHeight: number; theme: string; readerMode?: 'scroll' | 'page' },
 ): string {
   const themeClass = `reader-theme-${settings.theme}`;
+  const pageClass = settings.readerMode === 'page' ? ' reader-page-mode' : '';
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -2788,7 +3037,7 @@ function buildSrcDoc(
 <style>${bookCss || ''}</style>
 <style>${READER_BASE_CSS}</style>
 </head>
-<body class="reader-html-content ${themeClass}">
+<body class="reader-html-content ${themeClass}${pageClass}">
 ${content}
 </body>
 </html>`;

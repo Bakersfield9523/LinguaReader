@@ -146,6 +146,8 @@ export interface ReaderSettings {
   lineHeight: number;
   theme: 'light' | 'dark' | 'sepia';
   fontFamily: string;
+  /** 阅读模式：scroll=连续滑动，page=分页翻页 */
+  readerMode?: 'scroll' | 'page';
 }
 
 // 应用状态
