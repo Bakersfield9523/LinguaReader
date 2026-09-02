@@ -339,6 +339,94 @@ function ChapterTree({
 
 // ============ Reader 主组件 ============
 
+// ================= 翻页模式：分页算法 =================
+// 设计取舍：早先用 CSS 横向多列（column-width + overflow:hidden + scrollLeft 翻页）实现"翻页"，
+// 但在 EPUB iframe 内极不稳定——列数算成 1（整章只有一"页"）、body.scrollLeft 在部分
+// 布局下不生效（点了下一页纹丝不动）。改为"纵向按块贪心装箱"：
+//   · 布局与滑动模式完全一致（同一滚动容器、同一排版），只额外算出每页的 scrollTop 起点；
+//   · 翻页 = 把 scrollTop 平滑滚到下一页起点，滚动容器是真正的滚动容器，绝不会失效；
+//   · 分页边界落在块级元素（段落/标题/图片/列表项）之间，不会把一段文字或一张图切成两半；
+//   · 页码由 scrollTop 反推，因此用户手动滚轮也不会与页码失同步。
+const PAGE_BLOCK_TAGS = new Set([
+  'P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'BLOCKQUOTE', 'PRE', 'FIGURE', 'FIGCAPTION', 'TABLE', 'THEAD', 'TBODY', 'TR', 'HR',
+  'IMG', 'PICTURE', 'SVG', 'VIDEO', 'DIV', 'SECTION', 'ARTICLE', 'DD', 'DT',
+  'TD', 'TH', 'UL', 'OL', 'DL', 'HEADER', 'FOOTER', 'MAIN', 'ASIDE', 'ADDRESS',
+]);
+
+function computePageOffsets(root: HTMLElement | null, scroller: HTMLElement | null): number[] {
+  if (!root || !scroller) return [0];
+  const win = root.ownerDocument.defaultView;
+  if (!win) return [0];
+  const pageH = Math.max(120, scroller.clientHeight);
+  const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (maxScroll <= 0) return [0];
+
+  // 1) 收集候选块级元素
+  const candidates: HTMLElement[] = [];
+  const all = root.querySelectorAll<HTMLElement>('*');
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    if (!PAGE_BLOCK_TAGS.has(el.tagName)) continue;
+    const cs = win.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    if (cs.position === 'absolute' || cs.position === 'fixed') continue;
+    if (cs.float !== 'none') continue;
+    if (el.getBoundingClientRect().height <= 0) continue;
+    candidates.push(el);
+  }
+  // 2) 只保留"内部不再包含其它候选块"的最内层块，避免父子重复计数
+  const excluded = new Set<Element>();
+  for (const el of candidates) {
+    let p: Element | null = el.parentElement;
+    while (p) { excluded.add(p); p = p.parentElement; }
+  }
+  const leaves = candidates.filter(el => !excluded.has(el));
+  // 兜底：没有可识别的块、或块数量大到会影响翻页手感时，按固定页高均分
+  if (leaves.length === 0 || leaves.length > 4000) {
+    const n = Math.max(1, Math.round(scroller.scrollHeight / pageH));
+    return Array.from({ length: n }, (_, i) => Math.min(maxScroll, i * pageH));
+  }
+
+  // 3) 贪心装箱：元素整体放不下就另起一页；超过一屏的超高元素补中间页，防止内容被跳过
+  const rootRect = root.getBoundingClientRect();
+  // base = 内容根节点顶部在"滚动容器内容坐标系"里的位置
+  //  · 滚动容器是根元素（iframe 文档的 <html>）时，文档坐标 = 视口坐标 + scrollTop；
+  //  · 其它情况（<main> 作为滚动容器）需要减去容器自身的视口位置。
+  const isRootScroller = scroller === root.ownerDocument.documentElement;
+  const base = isRootScroller
+    ? rootRect.top + scroller.scrollTop
+    : (rootRect.top - scroller.getBoundingClientRect().top) + scroller.scrollTop;
+  const raw: number[] = [0];
+  let pageTop = 0;
+  const addOversizePages = (top: number, bottom: number) => {
+    // 元素本身高于一页：在元素内部补若干页，保证其下半部分也能翻到
+    let o = pageTop + pageH;
+    while (o < bottom - pageH * 0.25) { raw.push(o); o += pageH; }
+    pageTop = o - pageH;
+  };
+  for (const el of leaves) {
+    const r = el.getBoundingClientRect();
+    const top = (r.top - rootRect.top) + base;
+    const bottom = top + r.height;
+    if (top >= pageTop + pageH - 2 && top > pageTop) {
+      raw.push(top);
+      pageTop = top;
+      if (r.height > pageH) addOversizePages(top, bottom);
+    } else if (bottom > pageTop + pageH && r.height > pageH) {
+      addOversizePages(top, bottom);
+    }
+  }
+
+  // 4) 收敛到 [0, maxScroll] 并去掉过近的重复页（末页会被 maxScroll 截断，必须去重否则页码回退）
+  const out: number[] = [0];
+  for (const o of raw) {
+    const v = Math.max(0, Math.min(Math.round(o), maxScroll));
+    if (v > out[out.length - 1] + 8) out.push(v);
+  }
+  return out;
+}
+
 interface ReaderProps {
   book: Book;
   wordMarkers: WordMarker[];
@@ -473,13 +561,17 @@ export function Reader({
   currentChapterRef.current = currentChapter;
 
   // 翻页模式状态
+  // pageOffsets：每一页对应的 scrollTop 起点（按块级元素贪心装箱算出，保证不把段落/图片切成两半）
   const [currentPage, setCurrentPage] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
-  const pageModeRef = useRef(settings.readerMode === 'page');
-  pageModeRef.current = settings.readerMode === 'page';
+  const [pageOffsets, setPageOffsets] = useState<number[]>([0]);
+  const pageOffsetsRef = useRef<number[]>([0]);
+  pageOffsetsRef.current = pageOffsets;
   const pageContentRef = useRef<HTMLDivElement>(null);
   // 翻页模式下是否已恢复过初始页码（避免章节切换时反复跳回旧位置）
   const pageRestoredRef = useRef(false);
+  // 上次分页测量时的容器尺寸指纹：尺寸没变就不必重算（避免每次翻页都重排）
+  const pageMeasureKeyRef = useRef('');
 
   // 高亮/下划线
   const [highlights, setHighlights] = useState<Highlight[]>([]);
@@ -809,6 +901,23 @@ export function Reader({
     iframeApplySettings(doc, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, readerMode: settings.readerMode });
   }, [settings.fontSize, settings.lineHeight, settings.theme, settings.readerMode]);
 
+  // 翻页模式：由当前 scrollTop 反推页码（用户手动滚轮/触控滚动时保持页码同步），返回推算出的页码
+  const syncPageFromScroll = useCallback((scroller: HTMLElement | null, offsetsIn?: number[]): number => {
+    const offsets = (offsetsIn && offsetsIn.length ? offsetsIn : pageOffsetsRef.current) || [];
+    if (!scroller || offsets.length === 0) return 0;
+    const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const st = scroller.scrollTop;
+    let idx = 0;
+    for (let i = 0; i < offsets.length; i++) {
+      if (st + 4 >= offsets[i]) idx = i;
+    }
+    // 滚到底部一律算最后一页：末页 offset 会被 maxScroll 截断，
+    // 若不这样处理，页码会被 scroll 事件改回上一页，表现为"点下一页卡住"。
+    if (st >= maxScroll - 2) idx = offsets.length - 1;
+    setCurrentPage(idx);
+    return idx;
+  }, []);
+
   // 滚动位置保存（防抖，500ms）
   // PDF 模式下不处理滚动（PDF 用翻页而非滚动）
   const handleScroll = useCallback(() => {
@@ -817,13 +926,11 @@ export function Reader({
       const f = iframeRef.current;
       if (!f || !f.contentWindow) return;
       const doc = f.contentWindow.document;
-      // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），故用 doc.body；否则用 documentElement
-      const el = settings.readerMode === 'page' ? doc.body : (doc.scrollingElement || doc.body);
-      // 翻页模式为横向滚动，按 scrollLeft 计算章节内百分比；否则按 scrollTop
-      const scrollPercent = settings.readerMode === 'page'
-        ? el.scrollLeft / Math.max(1, el.scrollWidth - el.clientWidth)
-        : el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
+      // 翻页模式与滑动模式共用同一个纵向滚动容器（翻页只是按页跳转，布局完全一致）
+      const el = (doc.scrollingElement as HTMLElement) || doc.body;
+      const scrollPercent = el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
       scrollPosRef.current = Math.round(scrollPercent * 100);
+      if (settings.readerMode === 'page') syncPageFromScroll(el);
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
       scrollSaveTimerRef.current = setTimeout(() => {
         onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
@@ -836,11 +943,12 @@ export function Reader({
     const el = contentRef.current;
     const scrollPercent = el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight);
     scrollPosRef.current = Math.round(scrollPercent * 100);
+    if (settings.readerMode === 'page') syncPageFromScroll(el);
     if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
     scrollSaveTimerRef.current = setTimeout(() => {
       onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
     }, 500);
-  }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
+  }, [book.id, book.format, onUpdateProgress, epubRenderMode, settings.readerMode, syncPageFromScroll]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
 
   // 恢复滚动位置（只在 EPUB/TXT 非 iframe 模式下，且只执行一次）
@@ -878,80 +986,110 @@ export function Reader({
   }, [currentChapter]);
 
   // ================= 翻页模式（page mode）核心逻辑 =================
-  // 测量滚动容器与总页数：横向 CSS columns 下 scrollWidth / clientWidth
-  const measurePages = useCallback((): { el: HTMLElement | null; pages: number } => {
-    if (book.format === 'pdf') return { el: null, pages: 1 };
+  // 取"滚动容器 + 内容根节点"：iframe 模式下滚动发生在 iframe 文档内部；
+  // 否则滚动容器是 <main>，内容根节点是 pageContentRef。
+  const getPageScroller = useCallback((): { scroller: HTMLElement | null; root: HTMLElement | null } => {
+    if (book.format === 'pdf') return { scroller: null, root: null };
     if (epubRenderMode === 'iframe' && book.format === 'epub') {
       const f = iframeRef.current;
-      if (!f || !f.contentWindow) return { el: null, pages: 1 };
-      const doc = f.contentWindow.document;
-      // 翻页模式下 body 才是带 overflow:hidden 的横向多列滚动容器（不是 documentElement），
-      // 必须用 doc.body 测量/滚动，否则 window.scrollTo 因 documentElement 无横向溢出而失效。
-      const width = doc.body.clientWidth || f.clientWidth;
-      const scrollWidth = doc.body.scrollWidth;
-      const pages = Math.max(1, Math.round(scrollWidth / Math.max(1, width)));
-      return { el: doc.body, pages };
+      const doc = f && f.contentWindow ? f.contentWindow.document : null;
+      if (!doc || !doc.body) return { scroller: null, root: null };
+      return {
+        scroller: (doc.scrollingElement as HTMLElement) || doc.body,
+        root: doc.body,
+      };
     }
-    const el = pageContentRef.current;
-    if (!el) return { el: null, pages: 1 };
-    const width = el.clientWidth;
-    const scrollWidth = el.scrollWidth;
-    const pages = Math.max(1, Math.round(scrollWidth / Math.max(1, width)));
-    return { el, pages };
+    return { scroller: contentRef.current, root: pageContentRef.current };
   }, [book.format, epubRenderMode]);
 
-  const updateTotalPages = useCallback(() => {
-    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
-    const { pages } = measurePages();
-    setTotalPages(pages);
-  }, [settings.readerMode, book.format, measurePages]);
+  // 取得（必要时重算）每页 scrollTop 起点。
+  // 关键：绝不返回长度 1 的"假分页"——那会让整章变成一页、点下一页直接跳章。
+  const ensurePageOffsets = useCallback((): number[] => {
+    const { scroller, root } = getPageScroller();
+    if (!scroller || !root) return [0];
+    const key = `${scroller.scrollHeight}x${scroller.clientHeight}`;
+    if (pageMeasureKeyRef.current === key && pageOffsetsRef.current.length > 0) {
+      return pageOffsetsRef.current;
+    }
+    const offsets = computePageOffsets(root, scroller);
+    pageMeasureKeyRef.current = key;
+    setPageOffsets(offsets);
+    setTotalPages(offsets.length);
+    return offsets;
+  }, [getPageScroller]);
 
-  // 翻页模式下按章节内页码保存进度（复用 scrollPosition 字段存章节内百分比）
-  const savePageProgress = useCallback((page: number, pages: number) => {
-    const pos = pages > 1 ? Math.round((page / (pages - 1)) * 100) : 0;
-    scrollPosRef.current = pos;
-    onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, pos);
-  }, [book.id, onUpdateProgress]);
+  // 重新分页（尺寸/字号/内容变化后调用）
+  const updateTotalPages = useCallback((opts?: { restore?: boolean }) => {
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const { scroller } = getPageScroller();
+    pageMeasureKeyRef.current = '';
+    const offsets = ensurePageOffsets();
+    if (!scroller) return;
+    if (!pageRestoredRef.current) {
+      pageRestoredRef.current = true;
+      if (pendingRestorePosRef.current > 0) {
+        const max = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+        const target = (pendingRestorePosRef.current / 100) * max;
+        let idx = 0;
+        for (let i = 0; i < offsets.length; i++) if (target + 4 >= offsets[i]) idx = i;
+        setCurrentPage(idx);
+        scroller.scrollTop = offsets[idx];
+        return;
+      }
+    }
+    if (opts?.restore) return;
+    syncPageFromScroll(scroller, offsets);
+  }, [settings.readerMode, book.format, getPageScroller, ensurePageOffsets, syncPageFromScroll]);
 
   // 跳转到指定页（0-based）
   const goToPage = useCallback((pageIndex: number) => {
     if (settings.readerMode !== 'page' || book.format === 'pdf') return;
-    const { el, pages } = measurePages();
+    const { scroller } = getPageScroller();
+    if (!scroller) return;
+    const offsets = ensurePageOffsets();
+    const pages = offsets.length;
     const clamped = Math.max(0, Math.min(pageIndex, Math.max(0, pages - 1)));
     setCurrentPage(clamped);
-    if (epubRenderMode === 'iframe' && book.format === 'epub') {
-      const f = iframeRef.current;
-      if (!f || !f.contentWindow) return;
-      const doc = f.contentWindow.document;
-      // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），而非 window/documentElement
-      doc.body.scrollTo({ left: clamped * (doc.body.clientWidth || f.clientWidth), behavior: 'smooth' });
-    } else if (el) {
-      el.scrollTo({ left: clamped * el.clientWidth, behavior: 'smooth' });
-    }
-    savePageProgress(clamped, pages);
-  }, [settings.readerMode, book.format, epubRenderMode, measurePages, savePageProgress]);
+    const max = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+    scroller.scrollTo({ top: offsets[clamped], behavior: 'smooth' });
+    // 立即按目标位置保存进度（平滑滚动结束前用户可能就切章了）
+    const pos = Math.max(0, Math.min(100, Math.round((offsets[clamped] / max) * 100)));
+    scrollPosRef.current = pos;
+    onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, pos);
+  }, [settings.readerMode, book.format, getPageScroller, ensurePageOffsets, onUpdateProgress]);
 
   const nextPage = useCallback(() => {
-    if (currentPage >= totalPages - 1) {
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const { scroller } = getPageScroller();
+    const offsets = ensurePageOffsets();
+    const pages = offsets.length;
+    // 以"真实滚动位置"为准推算当前页，避免 state 与滚动不同步导致卡在某一页
+    const cur = syncPageFromScroll(scroller, offsets);
+    if (cur >= pages - 1) {
       // 最后一页：进入下一章（如果有）
       if (currentChapter < flatChapters.length - 1) {
         changeChapter(currentChapter + 1);
       }
       return;
     }
-    goToPage(currentPage + 1);
-  }, [currentPage, totalPages, currentChapter, flatChapters.length, goToPage, changeChapter]);
+    goToPage(cur + 1);
+  }, [settings.readerMode, book.format, getPageScroller, ensurePageOffsets, syncPageFromScroll, currentChapter, flatChapters.length, goToPage, changeChapter]);
 
   const prevPage = useCallback(() => {
-    if (currentPage <= 0) {
-      // 第一页：回到上一章末尾（如果有）
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const { scroller } = getPageScroller();
+    const offsets = ensurePageOffsets();
+    // 以"真实滚动位置"为准推算当前页
+    const cur = syncPageFromScroll(scroller, offsets);
+    if (cur <= 0) {
+      // 第一页：回到上一章
       if (currentChapter > 0) {
         changeChapter(currentChapter - 1);
       }
       return;
     }
-    goToPage(currentPage - 1);
-  }, [currentPage, currentChapter, goToPage, changeChapter]);
+    goToPage(cur - 1);
+  }, [settings.readerMode, book.format, getPageScroller, ensurePageOffsets, syncPageFromScroll, currentChapter, goToPage, changeChapter]);
 
   // 键盘翻页
   useEffect(() => {
@@ -971,37 +1109,27 @@ export function Reader({
     return () => window.removeEventListener('keydown', handler);
   }, [settings.readerMode, book.format, nextPage, prevPage]);
 
-  // 章节切换时重置到第 0 页；内容/窗口尺寸变化后重新测量页数；初次打开时恢复上次页码
+  // 章节切换 / 内容 / 字号 / 侧栏宽度变化后重新分页；初次打开时恢复上次页码
+  const lastPageChapterKeyRef = useRef('');
   useEffect(() => {
-    setCurrentPage(0);
-    // 延迟测量，等待渲染完成
-    const t1 = setTimeout(() => {
-      updateTotalPages();
-      // 初次打开（仅一次）根据保存的章节内百分比恢复页码
-      if (!pageRestoredRef.current && pendingRestorePosRef.current > 0) {
-        const { el, pages } = measurePages();
-        const page = Math.min(
-          Math.max(0, pages - 1),
-          Math.round((pendingRestorePosRef.current / 100) * Math.max(0, pages - 1))
-        );
-        if (page > 0) {
-          setCurrentPage(page);
-          if (epubRenderMode === 'iframe' && book.format === 'epub') {
-            const f = iframeRef.current;
-            if (f?.contentWindow) f.contentWindow.document.body.scrollTo({ left: page * (f.contentWindow.document.body.clientWidth || f.clientWidth) });
-          } else if (el) {
-            el.scrollTo({ left: page * el.clientWidth });
-          }
-        }
-        pageRestoredRef.current = true;
-      }
-    }, 150);
-    const t2 = setTimeout(() => updateTotalPages(), 600);
-    return () => { clearTimeout(t1); clearTimeout(t2); };
-  }, [currentChapter, chapterContent, settings.readerMode, updateTotalPages, measurePages]);
+    if (settings.readerMode !== 'page' || book.format === 'pdf') return;
+    const key = `${currentChapter}`;
+    const chapterChanged = lastPageChapterKeyRef.current !== key;
+    lastPageChapterKeyRef.current = key;
+    // 换章才回到第 0 页；仅切模式/改字号时保留当前位置，只重算分页
+    if (chapterChanged) setCurrentPage(0);
+    // 延迟测量，等待渲染/字体/图片布局稳定
+    const t1 = setTimeout(() => updateTotalPages({ restore: chapterChanged }), 180);
+    const t2 = setTimeout(() => updateTotalPages(), 700);
+    const t3 = setTimeout(() => updateTotalPages(), 1600);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+  }, [currentChapter, chapterContent, settings.readerMode, settings.fontSize, settings.lineHeight, settings.fontFamily, showSidebar, updateTotalPages]);
 
   useEffect(() => {
-    const handleResize = () => { updateTotalPages(); };
+    const handleResize = () => {
+      pageMeasureKeyRef.current = '';
+      updateTotalPages();
+    };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, [updateTotalPages]);
@@ -1661,20 +1789,17 @@ export function Reader({
     }
     if (savedPos > 0) {
       requestAnimationFrame(() => {
-        // 翻页模式下滚动容器是 body（overflow:hidden 的横向多列），故用它恢复横向位置
-        const scEl = settings.readerMode === 'page' ? doc.body : (doc.scrollingElement || doc.body);
-        if (settings.readerMode === 'page') {
-          const max = Math.max(1, scEl.scrollWidth - scEl.clientWidth);
-          scEl.scrollLeft = (savedPos / 100) * max;
-        } else {
-          const max = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
-          scEl.scrollTop = (savedPos / 100) * max;
-        }
+        // 翻页与滑动共用同一个纵向滚动容器，恢复逻辑完全一致
+        const scEl = (doc.scrollingElement as HTMLElement) || doc.body;
+        const max = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
+        scEl.scrollTop = (savedPos / 100) * max;
       });
     }
-    // 翻页模式下文档布局完成后再测量一次总页数（onLoad 时列布局可能尚未稳定）
+    // 翻页模式下文档布局完成后重新分页（onLoad 时图片/字体可能尚未完成布局）
     if (settings.readerMode === 'page') {
+      pageMeasureKeyRef.current = '';
       setTimeout(() => updateTotalPages(), 200);
+      setTimeout(() => updateTotalPages(), 800);
     }
   }, [settings.fontSize, settings.lineHeight, settings.theme, settings.readerMode, markedWords, currentChapterHighlights, onIframeClick, onIframeMouseup, handleScroll, updateTotalPages]);
 
@@ -2163,7 +2288,9 @@ export function Reader({
           ref={contentRef}
           onScroll={book.format === 'pdf' ? undefined : handleScroll}
           className={`flex-1 h-[calc(100vh-64px)] relative ${
-            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe') || settings.readerMode === 'page')
+            // 翻页模式下 <main> 仍需可滚动：翻页只是"按页跳转 scrollTop"，
+            // 与滑动模式共用同一个滚动容器，滚动才不会因为 overflow:hidden 而失效。
+            (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe'))
               ? 'overflow-hidden'
               : 'overflow-y-auto'
           } ${showSidebar && book.format !== 'pdf' ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
@@ -2205,26 +2332,15 @@ export function Reader({
               ref={pageContentRef}
               className={book.format === 'pdf'
                 ? ''
-                : settings.readerMode === 'page'
-                  ? 'h-full w-full reader-page-columns pb-20'
-                  : 'max-w-3xl mx-auto py-10 px-6 lg:px-10'}
+                // 翻页模式与滑动模式共用同一套排版，仅在翻页模式下多留底部空间给浮动页码条
+                : 'max-w-3xl mx-auto py-10 px-6 lg:px-10' + (settings.readerMode === 'page' ? ' pb-28' : '')}
               style={book.format === 'pdf'
                 ? undefined
-                : settings.readerMode === 'page'
-                  ? {
-                      fontSize: settings.fontSize,
-                      lineHeight: settings.lineHeight,
-                      fontFamily: settings.fontFamily,
-                      columnWidth: '100%',
-                      columnGap: 0,
-                      columnFill: 'auto',
-                      overflow: 'hidden'
-                    }
-                  : {
-                      fontSize: settings.fontSize,
-                      lineHeight: settings.lineHeight,
-                      fontFamily: settings.fontFamily
-                    }}
+                : {
+                    fontSize: settings.fontSize,
+                    lineHeight: settings.lineHeight,
+                    fontFamily: settings.fontFamily
+                  }}
             >
               {/* Chapter Title (EPUB/TXT only) */}
               {book.format !== 'pdf' && flatChapters[currentChapter] && (
@@ -2764,18 +2880,10 @@ body { margin: 0; padding: 0; }
   word-wrap: break-word;
   overflow-wrap: break-word;
 }
-/* 翻页模式：横向多列分页，父窗口按 clientWidth 步进滚动 */
+/* 翻页模式：排版与滑动模式完全一致（不再用 CSS 横向多列，那套在 iframe 里
+   列数经常算成 1 / scrollLeft 不生效）。只额外留出底部浮动页码条的空间。 */
 .reader-html-content.reader-page-mode {
-  height: 100vh;
-  max-width: none;
-  margin: 0;
-  /* 仅保留纵向内边距（底部留出浮动页码条空间）；横向必须为 0，
-     否则列宽 = clientWidth - 横向 padding，与按 clientWidth 步进翻页错位 */
-  padding: 2.5rem 0 5rem;
-  overflow: hidden;
-  column-width: 100vw;
-  column-gap: 0;
-  column-fill: auto;
+  padding-bottom: 7rem;
 }
 .reader-theme-light { background: #f5f2e9; color: #2c2c2c; }
 .reader-theme-dark { background: #1a1c1f; color: #e0e0e0; }
@@ -2868,6 +2976,24 @@ function iframeApplySettings(doc: Document, s: IframeSettings) {
   doc.documentElement.style.setProperty('--reader-font', s.fontSize + 'px');
   doc.documentElement.style.setProperty('--reader-line', String(s.lineHeight));
   doc.body.className = 'reader-html-content reader-theme-' + s.theme + (s.readerMode === 'page' ? ' reader-page-mode' : '');
+  // 翻页模式依赖 iframe 文档自身的纵向滚动。部分原书 CSS 会把 html/body 设成
+  // height:100%; overflow:hidden，导致滚动容器高度为 0、翻页完全失效，这里显式兜底。
+  const html = doc.documentElement;
+  if (s.readerMode === 'page') {
+    html.style.overflowX = 'hidden';
+    html.style.overflowY = 'auto';
+    html.style.height = 'auto';
+    doc.body.style.overflow = 'visible';
+    doc.body.style.height = 'auto';
+    doc.body.style.minHeight = '0';
+  } else {
+    html.style.overflowX = '';
+    html.style.overflowY = '';
+    html.style.height = '';
+    doc.body.style.overflow = '';
+    doc.body.style.height = '';
+    doc.body.style.minHeight = '';
+  }
 }
 function iframeCleanWord(w: string, isPhrase: boolean): string {
   if (isPhrase) return w.trim().replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
