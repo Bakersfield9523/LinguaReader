@@ -6,13 +6,14 @@ const MW_BASE_URL = 'https://www.dictionaryapi.com/api/v3/references/learners/js
 // Key 从环境变量读取（见 .env.example），避免明文写入源码 / git 历史
 const MW_API_KEY = import.meta.env.VITE_MW_API_KEY ?? '';
 
-// 回退源：Free Dictionary API（免费、无需 Key、覆盖常见词）。
-// MW 在代理不通 / 限流 / 超时时会整个查不到，单源会导致"明明是常见词却找不到"。
-const FD_BASE_URL = 'https://api.dictionaryapi.dev/api/v2/entries/en';
+// 回退源：Wiktionary（维基词典）API —— 免费、无需 Key、覆盖极全。
+// 为何选它而非 Free Dictionary：后者 (api.dictionaryapi.dev) 在本机 Cloudflare + 代理下 TLS 握手失败（curl exit 35），
+// 而 Wiktionary 同环境稳定 200；且浏览器/WebView 不能自定义 User-Agent，Wiktionary 不强制要求。
+const WT_API = 'https://en.wiktionary.org/w/api.php';
 // 超时：原先 10s 太长，且失败后会串行再试短语和词形还原（最坏 30s+）。
 // 现在两源并发，最坏只等 MW_TIMEOUT_MS。
 const MW_TIMEOUT_MS = 5000;
-const FD_TIMEOUT_MS = 6000;
+const WT_TIMEOUT_MS = 6000;
 // 失败结果只缓存这么久：网络抖动不应该把某个词"永久判死"
 const ONLINE_FAIL_TTL_MS = 60_000;
 
@@ -193,38 +194,66 @@ async function fetchJson(url: string, ms: number): Promise<any> {
   }
 }
 
-// 回退源：Free Dictionary API
-async function getFreeDictionaryDefinition(word: string): Promise<DictionaryDefinition | null> {
-  try {
-    const data = await fetchJson(`${FD_BASE_URL}/${encodeURIComponent(word)}`, FD_TIMEOUT_MS);
-    if (!Array.isArray(data) || data.length === 0) return null;
-    const entry = data[0];
-    const defs: string[] = [];
-    const parts: string[] = [];
-    for (const m of entry?.meanings || []) {
-      if (m?.partOfSpeech && !parts.includes(m.partOfSpeech)) parts.push(m.partOfSpeech);
-      for (const d of m?.definitions || []) {
-        if (d?.definition) defs.push(String(d.definition));
+// 回退源：Wiktionary（维基词典）API。
+// 解析英文词条 wikitext：真实释义是 `===Noun===` 等词性小节下以 `#` 开头的条目
+// （`#:` 是近义词/例句子项、`#*` 是引文，均排除）；词性标题可能是 3 或 4 个等号（多词源时为 `====Noun====`）。
+function cleanWikiText(t: string): string {
+  return t
+    .replace(/\[\[([^\]|\n]+)\|([^\]\n]+)\]\]/g, '$2') // [[w|disp]] -> disp
+    .replace(/\[\[([^\]\n]+)\]\]/g, '$1')              // [[w]] -> w
+    .replace(/'''/g, '')
+    .replace(/''/g, '')
+    .replace(/\{\{lb\|en\|([^}]*)\}\}/g, '($1) ')
+    .replace(/\{\{[^}]*\}\}/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&[a-z]+;/g, ' ')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseWiktionary(wt: string): { pos: string | undefined; defs: string[] } | null {
+  const m = wt.match(/==English==([\s\S]*?)(?=\n==[A-Z][a-z]|$)/);
+  const en = m ? m[1] : '';
+  if (!en) return null;
+  const POS: Record<string, string> = {
+    Noun: 'noun', Verb: 'verb', Adjective: 'adj', Adverb: 'adv', Pronoun: 'pron',
+    Preposition: 'prep', Conjunction: 'conj', Interjection: 'intj', Determiner: 'det',
+    Article: 'art', Numeral: 'num', Particle: 'particle', Abbreviation: 'abbr',
+    ProperNoun: 'propn', Auxiliary: 'aux', Suffix: 'suffix', Prefix: 'prefix',
+    Symbol: 'symbol', Phrase: 'phrase', Idiom: 'idiom',
+  };
+  const defs: string[] = [];
+  let pos: string | undefined;
+  let firstPos: string | undefined;
+  for (const line of en.split('\n')) {
+    const h = line.match(/^={3,4}([A-Za-z]+)/);
+    if (h) { pos = POS[h[1]]; continue; }
+    if (pos !== undefined && /^#(?![:*])/.test(line)) {
+      const txt = cleanWikiText(line.replace(/^#+\s*/, ''));
+      if (txt && !/^[\*\|\}]/.test(txt)) {
+        if (!firstPos) firstPos = pos;
+        defs.push(txt);
       }
     }
-    if (defs.length === 0) return null;
-    let phonetic: string | undefined;
-    let audio: string | undefined;
-    for (const p of entry?.phonetics || []) {
-      if (!phonetic && p?.text) phonetic = p.text;
-      if (!audio && p?.audio) audio = p.audio;
-    }
+  }
+  return defs.length ? { pos: firstPos, defs: defs.slice(0, 8) } : null;
+}
+
+async function getWiktionaryDefinition(word: string): Promise<DictionaryDefinition | null> {
+  try {
+    const url = `${WT_API}?action=parse&page=${encodeURIComponent(word)}&prop=wikitext&format=json&redirects=1`;
+    const data = await fetchJson(url, WT_TIMEOUT_MS);
+    const wt = data?.parse?.wikitext?.['*'];
+    if (typeof wt !== 'string' || !wt) return null;
+    const parsed = parseWiktionary(wt);
+    if (!parsed) return null;
     return {
-      word: entry?.word || word,
-      phonetic,
-      ukPhonetic: phonetic,
-      usPhonetic: phonetic,
-      partOfSpeech: parts.length ? parts.join(' / ') : undefined,
-      definitions: defs.slice(0, 8),
+      word,
+      phonetic: undefined,
+      partOfSpeech: parsed.pos,
+      definitions: parsed.defs,
       examples: [],
-      audio,
-      ukAudio: audio,
-      usAudio: audio,
     };
   } catch {
     return null;
@@ -297,7 +326,7 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
   const hit = onlineDefCache.get(cacheKey);
   if (hit && hit.exp > Date.now()) return hit.v;
 
-  const fdPromise = getFreeDictionaryDefinition(cacheKey);
+  const fdPromise = getWiktionaryDefinition(cacheKey);
   const mwPromise = getMwDefinition(cacheKey);
 
   let result: DictionaryDefinition | null = null;
