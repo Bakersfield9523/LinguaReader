@@ -2040,7 +2040,7 @@ export function Reader({
             (book.format === 'pdf' || (book.format === 'epub' && epubRenderMode === 'iframe'))
               ? 'overflow-hidden'
               : 'overflow-y-auto'
-          } ${showSidebar && book.format !== 'pdf' ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
+          } ${showSidebar ? 'lg:mr-[400px] transition-[margin] duration-300' : ''}`}
         >
           {book.format === 'epub' && epubRenderMode === 'iframe' ? (
             <div className="flex flex-col h-full">
@@ -2127,7 +2127,7 @@ export function Reader({
 
         {/* Sidebar */}
         {showSidebar && (
-          <aside className="fixed right-0 top-[64px] bottom-0 w-full lg:w-[400px] border-l border-current/10 bg-inherit overflow-y-auto z-30">
+          <aside className={`fixed right-0 top-[64px] bottom-0 w-full lg:w-[400px] border-l border-current/10 overflow-y-auto z-30 ${themeStyles[settings.theme]}`}>
             <div className="p-6">
               {/* ===== 模式 1: 选中文本操作面板 ===== */}
               {sidebarMode === 'selection' && (
