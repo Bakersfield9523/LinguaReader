@@ -1403,7 +1403,7 @@ export function Reader({
     const doc = f && f.contentDocument;
     if (!doc || !doc.body || !iframeLoadedRef.current) return;
     const prevY = doc.scrollingElement ? (doc.scrollingElement as HTMLElement).scrollTop : 0;
-    iframeApplyAll(doc, iframeCleanHtmlRef.current, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, fontFamily: fontStack, fontOverride }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })));
+    iframeApplyAll(doc, iframeCleanHtmlRef.current, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, fontFamily: fontStack, fontOverride }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note, type: h.type })));
     try { if (doc.scrollingElement) (doc.scrollingElement as HTMLElement).scrollTop = prevY; } catch (err) { /* ignore */ }
   }, [markedWords, currentChapterHighlights]);
 
@@ -1528,7 +1528,7 @@ export function Reader({
       theme: settings.theme,
       fontFamily: fontStack,
       fontOverride,
-    }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note })));
+    }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note, type: h.type })));
     // 绑定交互事件（在 iframe 文档上，绕开 CSP 内联脚本限制）
     doc.body.addEventListener('click', onIframeClick as EventListener);
     doc.body.addEventListener('mouseup', onIframeMouseup as EventListener);
@@ -2670,6 +2670,23 @@ body { margin: 0; padding: 0; }
   cursor: pointer !important;
   color: inherit !important;
 }
+/* 用户划线（下划线 / 底色高亮）。iframe 是独立文档，不加载 App.css，故在此再写一份。
+   !important 用于压过书籍自带 CSS（.reader-html-content span 特异性更高）。 */
+.reader-html-content [data-highlight-id] {
+  cursor: pointer !important;
+}
+.reader-html-content [data-highlight-id][data-hl-type="underline"] {
+  background: transparent !important;
+  border-bottom: 2px solid #e5a349 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}
+.reader-html-content [data-highlight-id][data-hl-type="highlight"] {
+  background-color: rgba(229, 163, 73, 0.35) !important;
+  border-bottom: 2px solid #e5a349 !important;
+  border-radius: 2px !important;
+  padding: 0 2px !important;
+}
 .reader-theme-dark .reader-html-content a { color: #e5a349; }
 .reader-theme-sepia .reader-html-content a { color: #8b6914; }
 .reader-theme-light .reader-html-content a { color: #c47a1a; }
@@ -2682,7 +2699,7 @@ body { margin: 0; padding: 0; }
 // 直接操作其 contentDocument，注入样式、绑定事件、应用高亮/标记/脚注，彻底绕开 CSP。
 
 type IframeSettings = { fontSize: number; lineHeight: number; theme: string; fontFamily: string; fontOverride: boolean };
-type IframeHighlight = { id: string; text: string; note?: string };
+type IframeHighlight = { id: string; text: string; note?: string; type?: string };
 
 function iframeApplySettings(doc: Document, s: IframeSettings) {
   doc.documentElement.style.setProperty('--reader-font', s.fontSize + 'px');
@@ -2827,7 +2844,7 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
       while (true) {
         const idx = text.indexOf(t, from); if (idx < 0) { frag.appendChild(doc.createTextNode(text.slice(from))); break; }
         if (idx > from) frag.appendChild(doc.createTextNode(text.slice(from, idx)));
-        const span = doc.createElement('span'); span.setAttribute('data-highlight-id', it.id); span.className = 'user-highlight'; span.textContent = text.slice(idx, idx + t.length); frag.appendChild(span); from = idx + t.length;
+        const span = doc.createElement('span'); span.setAttribute('data-highlight-id', it.id); span.setAttribute('data-hl-type', it.type === 'underline' ? 'underline' : 'highlight'); span.className = 'user-highlight'; span.textContent = text.slice(idx, idx + t.length); frag.appendChild(span); from = idx + t.length;
       }
       node.parentNode.replaceChild(frag, node);
     }
@@ -2873,7 +2890,7 @@ function parseHtmlToReact(
   highlights: Highlight[],
 ): React.ReactNode {
   // 1) 抽取"高亮文本 → ID" 区间
-  const hlRanges: Array<{ start: number; end: number; id: string; hasNote: boolean }> = [];
+  const hlRanges: Array<{ start: number; end: number; id: string; hasNote: boolean; type?: string }> = [];
   const tempDiv = document.createElement('div');
   tempDiv.innerHTML = html;
   const plainText = (tempDiv.textContent || '');
@@ -2891,7 +2908,7 @@ function parseHtmlToReact(
         (i <= r.start && i + t.length >= r.end)
       );
       if (!overlapped) {
-        hlRanges.push({ start: i, end: i + t.length, id: hl.id, hasNote: !!hl.note });
+        hlRanges.push({ start: i, end: i + t.length, id: hl.id, hasNote: !!hl.note, type: hl.type });
       }
       from = i + Math.max(1, t.length);
     }
@@ -2926,7 +2943,10 @@ function parseHtmlToReact(
       segs.push(React.createElement('span', {
         key: `hl-${r.id}-${basePlainStart}`,
         'data-highlight-id': r.id,
-        className: 'border-b-2 border-[#e5a349] cursor-pointer hover:bg-[#e5a349]/10 transition-colors',
+        // data-hl-type 供 CSS 区分"下划线/底色高亮"；样式由 App.css 的 !important 规则兜底，
+        // 避免书籍自带 CSS（.reader-html-content span 之类，特异性更高）把下划线边框覆盖掉。
+        'data-hl-type': r.type === 'underline' ? 'underline' : 'highlight',
+        className: 'reader-hl cursor-pointer hover:bg-[#e5a349]/10 transition-colors',
       }, ...hlInner));
       pos = r.end;
     }

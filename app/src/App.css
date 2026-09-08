@@ -442,6 +442,25 @@ textarea:focus-visible {
   color: inherit !important;
 }
 
+/* 用户划线：区分「下划线」与「底色高亮」。
+   必须 !important —— 书籍自带 CSS 经 scopeCss 后形如 `.reader-html-content span`，
+   特异性高于 Tailwind 单类（border-b-2），会把下划线的 border-bottom 覆盖掉导致"画了看不见"。 */
+.reader-html-content [data-highlight-id] {
+  cursor: pointer !important;
+}
+.reader-html-content [data-highlight-id][data-hl-type="underline"] {
+  background: transparent !important;
+  border-bottom: 2px solid #e5a349 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}
+.reader-html-content [data-highlight-id][data-hl-type="highlight"] {
+  background-color: rgba(229, 163, 73, 0.35) !important;
+  border-bottom: 2px solid #e5a349 !important;
+  border-radius: 2px !important;
+  padding: 0 2px !important;
+}
+
 /* Dark theme adjustments for reader content */
 .reader-theme-dark .reader-html-content a {
   color: #e5a349;

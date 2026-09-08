@@ -498,32 +498,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       CSSany.highlights.delete('pdf-sel');
     }
 
-    if (useHighlight) {
-      // ── 路线 B：CSS Custom Highlight API 精确染色（零 side-bearing 缝隙，Koodo 效果）──
-      const hlRanges: Range[] = [];
-      const ulRanges: Range[] = [];
-      for (const entry of hlEntries) {
-        const ranges = rangesForRange(entry.range[0], entry.range[1]);
-        if (entry.type === 'underline') ulRanges.push(...ranges);
-        else hlRanges.push(...ranges);
-      }
-      const markRanges = rangesForIndices(markedIndices);
-      const sel = selRangeRef.current;
-      const selRanges = sel ? rangesForRange(sel[0], sel[1]) : [];
-      const HighlightCtor = (window as any).Highlight;
-      CSSany.highlights.set('pdf-hl', new HighlightCtor(...hlRanges));
-      CSSany.highlights.set('pdf-ul', new HighlightCtor(...ulRanges));
-      CSSany.highlights.set('pdf-mark', new HighlightCtor(...markRanges));
-      CSSany.highlights.set('pdf-sel', new HighlightCtor(...selRanges));
-      if (typeof window !== 'undefined' && (window as any).__pdfDebug !== false) {
-        console.log('[PDF overlay] highlight ranges: hl=%d ul=%d mark=%d sel=%d', hlRanges.length, ulRanges.length, markRanges.length, selRanges.length);
-      }
-      // 链接区域仍需写入 overlay（高亮背景由 CSS.highlights 显示，不依赖 DOM 结构）
-      container.innerHTML = linkParts.join('');
-      return;
-    }
-
-    // ── Fallback：不支持 Highlight API 时，退回原坐标覆盖层矩形 ──
+    // 覆盖层内容 + 同行合并工具（Highlight API 路线与 Fallback 路线共用）
     const parts: string[] = [];
     function pushMergedSegments(
       indices: number[],
@@ -544,28 +519,65 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         }
       }
     }
-    for (const entry of hlEntries) {
-      const [s, e] = entry.range;
-      const indices: number[] = [];
-      for (let i = s; i <= e && i < words.length; i++) indices.push(i);
-      if (entry.type === 'underline') {
+    // 下划线一律用实体 2px 矩形绘制，不依赖 ::highlight(pdf-ul) 的 text-decoration。
+    // 原因：Tauri WebView2 下 ::highlight() 只稳定绘制 background-color，text-decoration 不绘制，
+    // 导致"画下划线"后正文里什么都看不到（底色高亮正常，因为它走 background-color）。
+    function pushUnderlines() {
+      for (const entry of hlEntries) {
+        if (entry.type !== 'underline') continue;
+        const [s, e] = entry.range;
+        const indices: number[] = [];
+        for (let i = s; i <= e && i < words.length; i++) indices.push(i);
         pushMergedSegments(indices, (first, last) => {
           const ov = wordOverflow(last.h);
           const top = Math.round(first.y + first.h + ov.padTop * 0.3);
           const left = Math.round(first.x - ov.padLeft);
           const width = Math.max(2, Math.round(last.x + last.w - first.x) + ov.padW);
-          return `<div style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:2px;background:#e5a349;border-radius:1px;z-index:2;"></div>`;
-        });
-      } else {
-        pushMergedSegments(indices, (first, last) => {
-          const ov = wordOverflow(last.h);
-          const top = Math.round(first.y - ov.padTop);
-          const left = Math.round(first.x - ov.padLeft);
-          const width = Math.max(2, Math.round(last.x + last.w - first.x) + ov.padW);
-          const height = Math.max(6, Math.round(last.y + last.h - first.y) + ov.padH);
-          return `<div style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(229,163,73,0.55);border-radius:2px;z-index:1;"></div>`;
+          return `<div data-ul-overlay="1" style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:2px;background:#e5a349;border-radius:1px;z-index:2;"></div>`;
         });
       }
+    }
+
+    if (useHighlight) {
+      // ── 路线 B：CSS Custom Highlight API 精确染色（零 side-bearing 缝隙，Koodo 效果）──
+      // 仅负责"底色"类：background-color 是 Highlight API 稳定绘制的属性。
+      // 下划线不走这里（text-decoration 不绘制），交给 pushUnderlines 画实体矩形。
+      const hlRanges: Range[] = [];
+      for (const entry of hlEntries) {
+        if (entry.type === 'underline') continue;
+        hlRanges.push(...rangesForRange(entry.range[0], entry.range[1]));
+      }
+      const markRanges = rangesForIndices(markedIndices);
+      const sel = selRangeRef.current;
+      const selRanges = sel ? rangesForRange(sel[0], sel[1]) : [];
+      const HighlightCtor = (window as any).Highlight;
+      CSSany.highlights.set('pdf-hl', new HighlightCtor(...hlRanges));
+      CSSany.highlights.set('pdf-mark', new HighlightCtor(...markRanges));
+      CSSany.highlights.set('pdf-sel', new HighlightCtor(...selRanges));
+      if (typeof window !== 'undefined' && (window as any).__pdfDebug !== false) {
+        console.log('[PDF overlay] highlight ranges: hl=%d mark=%d sel=%d', hlRanges.length, markRanges.length, selRanges.length);
+      }
+      // 底色高亮由 CSS.highlights 显示；下划线 + 链接区仍需写入 overlay DOM
+      pushUnderlines();
+      container.innerHTML = [...parts, ...linkParts].join('');
+      return;
+    }
+
+    // ── Fallback：不支持 Highlight API 时，退回原坐标覆盖层矩形 ──
+    pushUnderlines();
+    for (const entry of hlEntries) {
+      if (entry.type === 'underline') continue; // 已在 pushUnderlines 处理
+      const [s, e] = entry.range;
+      const indices: number[] = [];
+      for (let i = s; i <= e && i < words.length; i++) indices.push(i);
+      pushMergedSegments(indices, (first, last) => {
+        const ov = wordOverflow(last.h);
+        const top = Math.round(first.y - ov.padTop);
+        const left = Math.round(first.x - ov.padLeft);
+        const width = Math.max(2, Math.round(last.x + last.w - first.x) + ov.padW);
+        const height = Math.max(6, Math.round(last.y + last.h - first.y) + ov.padH);
+        return `<div style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(229,163,73,0.55);border-radius:2px;z-index:1;"></div>`;
+      });
     }
     pushMergedSegments(markedIndices, (first, last) => {
       const ov = wordOverflow(last.h);
