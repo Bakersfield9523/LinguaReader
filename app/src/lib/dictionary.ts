@@ -6,6 +6,16 @@ const MW_BASE_URL = 'https://www.dictionaryapi.com/api/v3/references/learners/js
 // Key 从环境变量读取（见 .env.example），避免明文写入源码 / git 历史
 const MW_API_KEY = import.meta.env.VITE_MW_API_KEY ?? '';
 
+// 回退源：Free Dictionary API（免费、无需 Key、覆盖常见词）。
+// MW 在代理不通 / 限流 / 超时时会整个查不到，单源会导致"明明是常见词却找不到"。
+const FD_BASE_URL = 'https://api.dictionaryapi.dev/api/v2/entries/en';
+// 超时：原先 10s 太长，且失败后会串行再试短语和词形还原（最坏 30s+）。
+// 现在两源并发，最坏只等 MW_TIMEOUT_MS。
+const MW_TIMEOUT_MS = 5000;
+const FD_TIMEOUT_MS = 6000;
+// 失败结果只缓存这么久：网络抖动不应该把某个词"永久判死"
+const ONLINE_FAIL_TTL_MS = 60_000;
+
 // 本地词典条目通用接口
 interface LocalDictEntry {
   word: string;
@@ -167,26 +177,72 @@ function buildMwAudioUrl(audio: string): string {
 
 // 在线释义结果缓存：避免同一单词重复发起网络请求（查词/标记卡顿优化）。
 // 命中缓存时直接返回，省去每次点击单词/标记单词时的网络往返。
-const onlineDefCache = new Map<string, DictionaryDefinition | null>();
+// 在线释义缓存：成功长期缓存，失败只缓存 ONLINE_FAIL_TTL_MS
+const onlineDefCache = new Map<string, { v: DictionaryDefinition | null; exp: number }>();
 
-// 获取英文单词定义（在线 API - Merriam-Webster Learner's）
-async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
+// 带超时的 JSON 拉取（失败一律返回 null，交由上层回退）
+async function fetchJson(url: string, ms: number): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 回退源：Free Dictionary API
+async function getFreeDictionaryDefinition(word: string): Promise<DictionaryDefinition | null> {
+  try {
+    const data = await fetchJson(`${FD_BASE_URL}/${encodeURIComponent(word)}`, FD_TIMEOUT_MS);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const entry = data[0];
+    const defs: string[] = [];
+    const parts: string[] = [];
+    for (const m of entry?.meanings || []) {
+      if (m?.partOfSpeech && !parts.includes(m.partOfSpeech)) parts.push(m.partOfSpeech);
+      for (const d of m?.definitions || []) {
+        if (d?.definition) defs.push(String(d.definition));
+      }
+    }
+    if (defs.length === 0) return null;
+    let phonetic: string | undefined;
+    let audio: string | undefined;
+    for (const p of entry?.phonetics || []) {
+      if (!phonetic && p?.text) phonetic = p.text;
+      if (!audio && p?.audio) audio = p.audio;
+    }
+    return {
+      word: entry?.word || word,
+      phonetic,
+      ukPhonetic: phonetic,
+      usPhonetic: phonetic,
+      partOfSpeech: parts.length ? parts.join(' / ') : undefined,
+      definitions: defs.slice(0, 8),
+      examples: [],
+      audio,
+      ukAudio: audio,
+      usAudio: audio,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Merriam-Webster Learner's（主源，质量最好）
+async function getMwDefinition(word: string): Promise<DictionaryDefinition | null> {
   const cacheKey = word.toLowerCase();
-  if (onlineDefCache.has(cacheKey)) return onlineDefCache.get(cacheKey)!;
   let result: DictionaryDefinition | null = null;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
     const url = `${MW_BASE_URL}/${encodeURIComponent(cacheKey)}?key=${MW_API_KEY}`;
-    const response = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
-    if (!response.ok) { onlineDefCache.set(cacheKey, null); return null; }
-
-    const data = await response.json();
-    if (!Array.isArray(data) || data.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
+    const data = await fetchJson(url, MW_TIMEOUT_MS);
+    if (!Array.isArray(data) || data.length === 0) return null;
 
     // MW 查不到时返回字符串数组（拼写建议）；只保留对象词条
     const entries = data.filter((e: any) => e && typeof e === 'object');
-    if (entries.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
+    if (entries.length === 0) return null;
 
     const firstEntry = entries[0];
     const wordOut = (firstEntry?.meta?.id || firstEntry?.hw || word).replace(/:\d+$/, '');
@@ -213,7 +269,7 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
         walkMw(d?.sseq || [], defs, exs);
       }
     }
-    if (defs.length === 0) { onlineDefCache.set(cacheKey, null); return null; }
+    if (defs.length === 0) return null;
 
     result = {
       word: wordOut,
@@ -228,10 +284,40 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
       usAudio: audio,
     };
   } catch (error) {
-    console.error('Dictionary API error:', error);
+    console.error('Dictionary API error (MW):', error);
     result = null;
   }
-  onlineDefCache.set(cacheKey, result);
+  return result;
+}
+
+// 英文主查询：MW 优先（质量最好），Free Dictionary 回退。
+// 两源并发发起——串行的话 MW 一挂就要等满超时才轮到回退源，用户感知就是"又慢又查不到"。
+async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
+  const cacheKey = word.toLowerCase();
+  const hit = onlineDefCache.get(cacheKey);
+  if (hit && hit.exp > Date.now()) return hit.v;
+
+  const fdPromise = getFreeDictionaryDefinition(cacheKey);
+  const mwPromise = getMwDefinition(cacheKey);
+
+  let result: DictionaryDefinition | null = null;
+  try {
+    result = await mwPromise;
+  } catch {
+    result = null;
+  }
+  if (!result) {
+    try {
+      result = await fdPromise;
+    } catch {
+      result = null;
+    }
+  }
+  // 成功长期缓存；失败只缓存 60s，网络恢复后可重试
+  onlineDefCache.set(cacheKey, {
+    v: result,
+    exp: result ? Number.MAX_SAFE_INTEGER : Date.now() + ONLINE_FAIL_TTL_MS,
+  });
   return result;
 }
 
