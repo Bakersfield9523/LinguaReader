@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { PronunciationButtons } from './PronunciationButtons';
 import { exportWordsToDocx, exportWordsToCSV } from '@/lib/exportWords';
 import { LANGUAGE_NAMES } from '@/types';
 import type { WordMarker, Book, Language } from '@/types';
@@ -361,6 +362,16 @@ export function Vocabulary({ words, books, onDeleteWord, onUpdateWord }: Vocabul
         <DialogContent className="bg-[#282b2f] border-white/10 text-white max-w-lg max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="text-3xl font-bold">{selectedWord?.word}</DialogTitle>
+            {selectedWord && (
+              <div className="mt-2">
+                <PronunciationButtons
+                  word={selectedWord.word}
+                  language={selectedWord.language}
+                  ukPhonetic={selectedWord.dictionaryDef?.ukPhonetic}
+                  usPhonetic={selectedWord.dictionaryDef?.usPhonetic}
+                />
+              </div>
+            )}
           </DialogHeader>
 
           {selectedWord && (

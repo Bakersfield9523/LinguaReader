@@ -7,12 +7,13 @@ import {
 } from 'lucide-react';
 import { AIChatPanel } from './AIChatPanel';
 import { PDFCanvasViewer } from './PDFCanvasViewer';
+import { PronunciationButtons } from './PronunciationButtons';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { lookupWord, getQuickTranslation } from '@/lib/dictionary';
-import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob } from '@/lib/fileParser';
+import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob, stripHtmlToText, countTextUnits } from '@/lib/fileParser';
 import { resolveFontStack, normalizeFontToken } from '@/lib/fonts';
 import { BookDB, HighlightDB } from '@/lib/db';
 import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse } from '@/lib/aiService';
@@ -23,32 +24,6 @@ import type { Book, WordMarker, DictionaryDefinition, ReaderSettings, Chapter, B
 // 旧逻辑按「章节序号 / 总章数」算进度，信息页/致谢/很短的章节都被当成一整章，进度失真。
 // 新逻辑：以各章字数为权重（卷首/附录 frontmatter 权重为 0），当前章再按滚动比例计入，
 // 得到「读了整本书百分之多少」的真实进度。
-
-/** 把章节 HTML 清洗为纯文本（用于估算字数） */
-function stripHtmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#0?39;|&apos;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/** 按语言统计「文本单元」数：CJK（如日语）按字符，其余按空格分词 */
-function countTextUnits(text: string, lang: string): number {
-  if (!text) return 0;
-  if (lang === 'ja' || lang === 'zh' || lang === 'ko') {
-    const m = text.match(/[぀-ヿ一-鿿]/g);
-    return m ? m.length : 0;
-  }
-  return text.split(/\s+/).filter((w) => w.length > 0).length;
-}
 
 /** 取某章字数：优先用已持久化的 wordCount，否则回退到本次会话估算的 ref */
 function weightOf(c: Chapter, map: Map<string, number>): number | undefined {
@@ -71,11 +46,21 @@ function computeReadingProgress(
 ): number {
   const N = flat.length;
   if (N === 0) return 0;
+  // 先统计已知字数的均值，作为尚未统计章节的估算权重。
+  // 否则未读章节会回退成 1，分母被严重低估 → 进度虚高（如读完 10% 却显示 ~99%）。
+  let knownSum = 0;
+  let knownCount = 0;
+  for (const c of flat) {
+    if (!c || c.type === 'frontmatter') continue;
+    const w = wordLookup(c);
+    if (w && w > 0) { knownSum += w; knownCount++; }
+  }
+  const avg = knownCount > 0 ? knownSum / knownCount : 1;
   const weightAt = (i: number): number => {
     const c = flat[i];
     if (!c || c.type === 'frontmatter') return 0; // 信息页/致谢/版权/附录不计入正文
     const w = wordLookup(c);
-    return w && w > 0 ? w : 1;
+    return w && w > 0 ? w : avg;
   };
   let total = 0;
   const before: number[] = new Array(N);
@@ -151,157 +136,6 @@ function MarqueeTitle({
         {children}
       </span>
     </span>
-  );
-}
-
-// ============ 单词发音按钮 ============
-
-interface PronunciationButtonsProps {
-  word: string;
-  language: string;
-  ukPhonetic?: string;
-  usPhonetic?: string;
-}
-
-function PronunciationButtons({ word, language, ukPhonetic, usPhonetic }: PronunciationButtonsProps) {
-  const [playing, setPlaying] = useState<'uk' | 'us' | null>(null);
-  const [supported, setSupported] = useState(true);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-
-  useEffect(() => {
-    const synth = window.speechSynthesis;
-    if (!synth) {
-      setSupported(false);
-      return;
-    }
-
-    // 尝试预加载 voices，部分浏览器/WebView 需要触发 onvoiceschanged 才能返回完整列表
-    if (typeof synth.onvoiceschanged !== 'undefined') {
-      synth.onvoiceschanged = () => {
-        synth.getVoices();
-      };
-    }
-    return () => {
-      synth.onvoiceschanged = null;
-      // 组件卸载时停止音频播放
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-      synth.cancel();
-    };
-  }, []);
-
-  // 切换单词时停止上一个音频
-  useEffect(() => {
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-      window.speechSynthesis?.cancel();
-      setPlaying(null);
-    };
-  }, [word]);
-
-  const speakWithTTS = useCallback((accent: 'uk' | 'us') => {
-    const synth = window.speechSynthesis;
-    if (!synth) return;
-
-    // 每次播放时重新获取 voices，避免组件 mount 时 voices 尚未加载
-    const all = synth.getVoices() || [];
-    const targetLang = accent === 'uk' ? 'en-GB' : 'en-US';
-    const voice =
-      all.find(v => v.lang.toLowerCase().startsWith(targetLang.toLowerCase())) ||
-      all.find(v => v.lang.toLowerCase().startsWith('en')) ||
-      all[0];
-
-    const utterance = new SpeechSynthesisUtterance(word);
-    if (voice) utterance.voice = voice;
-    utterance.lang = targetLang;
-    utterance.rate = 0.85;
-
-    utterance.onstart = () => setPlaying(accent);
-    utterance.onend = () => setPlaying(null);
-    utterance.onerror = () => setPlaying(null);
-
-    synth.speak(utterance);
-  }, [word]);
-
-  const play = useCallback((accent: 'uk' | 'us') => {
-    if (!word) return;
-
-    // 停止上一个播放
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    window.speechSynthesis?.cancel();
-
-    // 有道词典发音：type=0 英音 / type=1 美音，无需 API Key，稳定可用。
-    // 返回 MP3 音频流，覆盖绝大多数英文单词；加载失败时回退到 Web Speech TTS。
-    const youdaoUrl = `https://dict.youdao.com/dictvoice?type=${accent === 'uk' ? 0 : 1}&audio=${encodeURIComponent(word)}`;
-    setPlaying(accent); // 立即反馈
-    const el = new Audio(youdaoUrl);
-    audioRef.current = el;
-    el.onended = () => { setPlaying(null); audioRef.current = null; };
-    el.onerror = () => {
-      setPlaying(null);
-      audioRef.current = null;
-      // 有道音频加载失败时回退到 TTS
-      speakWithTTS(accent);
-    };
-    el.play().catch(() => {
-      setPlaying(null);
-      audioRef.current = null;
-      speakWithTTS(accent);
-    });
-  }, [word, speakWithTTS]);
-
-  if (language !== 'en') {
-    return null;
-  }
-
-  return (
-    <div className="flex items-center gap-3">
-      {/* 英式发音 pill */}
-      <button
-        onClick={() => play('uk')}
-        disabled={playing !== null}
-        className="group inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm
-                   bg-white hover:bg-gray-50 border border-gray-200
-                   shadow-[0_1px_3px_rgba(0,0,0,0.08)]
-                   transition-all duration-150 disabled:opacity-40"
-        title="英式发音"
-      >
-        <span className="text-gray-500 text-xs select-none font-medium">英</span>
-        {ukPhonetic ? (
-          <span className="text-gray-400 italic text-xs">{`/${ukPhonetic}/`}</span>
-        ) : (
-          <span className="text-gray-300 text-xs">—</span>
-        )}
-        <Volume2 className={`w-3.5 h-3.5 flex-shrink-0 ${playing === 'uk' ? 'text-[#e5a349] animate-pulse' : 'text-[#e5a349]/70 group-hover:text-[#e5a349]'}`} />
-      </button>
-
-      {/* 美式发音 pill */}
-      <button
-        onClick={() => play('us')}
-        disabled={playing !== null}
-        className="group inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm
-                   bg-white hover:bg-gray-50 border border-gray-200
-                   shadow-[0_1px_3px_rgba(0,0,0,0.08)]
-                   transition-all duration-150 disabled:opacity-40"
-        title="美式发音"
-      >
-        <span className="text-gray-500 text-xs select-none font-medium">美</span>
-        {usPhonetic ? (
-          <span className="text-gray-400 italic text-xs">{`/${usPhonetic}/`}</span>
-        ) : (
-          <span className="text-gray-300 text-xs">—</span>
-        )}
-        <Volume2 className={`w-3.5 h-3.5 flex-shrink-0 ${playing === 'us' ? 'text-[#e5a349] animate-pulse' : 'text-[#e5a349]/70 group-hover:text-[#e5a349]'}`} />
-      </button>
-    </div>
   );
 }
 
@@ -790,6 +624,55 @@ export function Reader({
           // 加载书签和高亮（await 确保数据加载完成后再允许交互）
           await loadBookmarks();
           await loadHighlights();
+
+          // 后台补全字数统计（一次性，之后靠持久化）：EPUB 全书各章字数 / PDF 逐页文本量。
+          // 不 await——不阻塞开书与交互；完成后持久化并重算一次进度，纠正之前的虚高旧值。
+          void (async () => {
+            try {
+              if (!isMounted) return;
+              if (parser instanceof EPUBParser) {
+                const needsScan = loadedChapters.some((c) => c.wordCount == null);
+                if (!needsScan) return;
+                const changed = await parser.estimateAllWordCounts(loadedChapters, book.language);
+                if (!changed || !isMounted) return;
+                const syncRef = (list: Chapter[]) => {
+                  for (const c of list) {
+                    if (c.href && c.wordCount != null) wordCountsRef.current.set(c.href, c.wordCount);
+                    if (c.children) syncRef(c.children);
+                  }
+                };
+                syncRef(loadedChapters);
+                await BookDB.update(book.id, { chapters: loadedChapters });
+                // 用当前位置重算一次进度，纠正虚高的旧值
+                const p = computeReadingProgress(
+                  flatChaptersRef.current,
+                  (c) => weightOf(c, wordCountsRef.current),
+                  currentChapterRef.current,
+                  scrollPosRef.current
+                );
+                bookProgressRef.current = p;
+                onUpdateProgress(book.id, p, currentChapterRef.current, scrollPosRef.current);
+              } else if (parser instanceof PDFParser) {
+                pageCountsRef.current = book.pageWordCounts || [];
+                if (pageCountsRef.current.length) return; // 已有统计，直接跳过
+                const counts = await parser.getPageTextCounts(book.language);
+                if (!isMounted || !counts.length) return;
+                pageCountsRef.current = counts;
+                await BookDB.update(book.id, { pageWordCounts: counts });
+                // 用当前页重算一次进度（PDF: currentChapter = 页码-1）
+                const total = counts.reduce((a, b) => a + b, 0);
+                if (total > 0) {
+                  const page = currentChapterRef.current + 1;
+                  const before = counts.slice(0, page - 1).reduce((a, b) => a + b, 0);
+                  const p = Math.max(1, Math.min(100, Math.round(((before + (counts[page - 1] || 0)) / total) * 100)));
+                  bookProgressRef.current = p;
+                  onUpdateProgress(book.id, p, currentChapterRef.current);
+                }
+              }
+            } catch {
+              // 静默失败，不影响阅读
+            }
+          })();
         }
       }
     }
@@ -1019,6 +902,8 @@ export function Reader({
   flatChaptersRef.current = flatChapters;
   // 本次会话内估算的各章字数（href -> 字数），用于按字数加权计算进度
   const wordCountsRef = useRef<Map<string, number>>(new Map());
+  // PDF 逐页文本量（词/字符数），用于按文本量加权进度；从 book.pageWordCounts 初始化
+  const pageCountsRef = useRef<number[]>(book.pageWordCounts || []);
   const contentsRef = useRef(contents);
   contentsRef.current = contents;
   const parserRef = useRef(parser);
@@ -1508,8 +1393,16 @@ export function Reader({
     // PDF 的 currentChapter 存的是页码-1
     const chapterIdx = page - 1;
     setCurrentChapter(chapterIdx);
-    // 保存阅读进度
-    const progress = pdfTotalPages > 0 ? Math.max(1, Math.round((page / pdfTotalPages) * 100)) : 0;
+    // 按每页文本量加权（图表/空白页权重低，密集正文页权重高）；无文字层(扫描版)回退等权按页
+    const counts = pageCountsRef.current;
+    const total = counts.length ? counts.reduce((a, b) => a + b, 0) : 0;
+    let progress: number;
+    if (total > 0 && counts.length >= pdfTotalPages) {
+      const before = counts.slice(0, page - 1).reduce((a, b) => a + b, 0);
+      progress = Math.max(1, Math.min(100, Math.round(((before + (counts[page - 1] || 0)) / total) * 100)));
+    } else {
+      progress = pdfTotalPages > 0 ? Math.max(1, Math.round((page / pdfTotalPages) * 100)) : 0;
+    }
     bookProgressRef.current = progress;
     onUpdateProgress(book.id, progress, chapterIdx);
   }, [book.id, pdfTotalPages, onUpdateProgress]);

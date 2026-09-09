@@ -275,6 +275,32 @@ function flattenChapters(chapters: Chapter[]): Chapter[] {
   return result;
 }
 
+/** 把章节 HTML 清洗为纯文本（用于估算字数） */
+export function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 按语言统计「文本单元」数：CJK（如日语）按字符，其余按空格分词 */
+export function countTextUnits(text: string, lang: string): number {
+  if (!text) return 0;
+  if (lang === 'ja' || lang === 'zh' || lang === 'ko') {
+    const m = text.match(/[぀-ヿ一-鿿]/g);
+    return m ? m.length : 0;
+  }
+  return text.split(/\s+/).filter((w) => w.length > 0).length;
+}
+
 // ============ EPUB 解析器（改进版） ============
 export class EPUBParser {
   private book: any;
@@ -933,6 +959,31 @@ export class EPUBParser {
     return fallback;
   }
 
+  /**
+   * 用原始 zip 文本为缺失 wordCount 的章节估算字数（轻量，无 DOM 解析），写回 chapters[].wordCount。
+   * 仅在打开书后的后台任务调用一次（之后靠持久化），返回是否有变更。
+   * ⚠️ 不要挂到 getChapters()（每次开书都会跑，会拖慢开书）；也不要用 getAllContent()（processHTML 太重）。
+   */
+  async estimateAllWordCounts(chapters: Chapter[], lang: string): Promise<boolean> {
+    let changed = false;
+    const fill = async (list: Chapter[]): Promise<void> => {
+      for (const c of list) {
+        if (c.children && c.children.length > 0) await fill(c.children);
+        if (c.wordCount != null || !c.href) continue;
+        try {
+          const raw = await this.readZipText(c.href);
+          if (!raw) continue;
+          const n = countTextUnits(stripHtmlToText(raw), lang);
+          if (n > 0) { c.wordCount = n; changed = true; }
+        } catch {
+          // ignore
+        }
+      }
+    };
+    await fill(chapters);
+    return changed;
+  }
+
   // 获取章节 HTML 内容（直接渲染，保留图片和格式）
   // 返回 { html: 清洗后的章节 HTML, css: 该章节涉及的书籍样式表（含内联与外部 link） }
   async getChapterContent(href: string): Promise<{ html: string; css: string }> {
@@ -1536,6 +1587,21 @@ export class PDFParser {
       }
     }
     return results;
+  }
+
+  /** 逐页统计文本量（词/字符数），用于按文本量加权的阅读进度。无文字层的扫描版返回全 0。 */
+  async getPageTextCounts(lang: string): Promise<number[]> {
+    const pages = this.getNumPages();
+    const counts: number[] = [];
+    for (let i = 1; i <= pages; i++) {
+      try {
+        const { text } = await this.getPageText(i);
+        counts.push(countTextUnits(text || '', lang));
+      } catch {
+        counts.push(0);
+      }
+    }
+    return counts;
   }
 
   async generateChaptersFromOutline(): Promise<Chapter[]> {

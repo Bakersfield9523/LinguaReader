@@ -37,6 +37,7 @@ export interface Book {
   scrollPosition?: number; // 滚动位置（百分比 0-100）
   totalWords?: number;
   chapters?: Chapter[];
+  pageWordCounts?: number[]; // PDF 按页文本量（词/字符数），用于按文本量加权进度；无文字层为全 0
   folderId?: string; // 所属文件夹ID
 }
 
