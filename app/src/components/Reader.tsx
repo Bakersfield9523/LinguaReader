@@ -19,6 +19,84 @@ import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse 
 import { SettingsDialog } from './SettingsDialog';
 import type { Book, WordMarker, DictionaryDefinition, ReaderSettings, Chapter, Bookmark, Highlight } from '@/types';
 
+// ============ 阅读进度（按字数加权）============
+// 旧逻辑按「章节序号 / 总章数」算进度，信息页/致谢/很短的章节都被当成一整章，进度失真。
+// 新逻辑：以各章字数为权重（卷首/附录 frontmatter 权重为 0），当前章再按滚动比例计入，
+// 得到「读了整本书百分之多少」的真实进度。
+
+/** 把章节 HTML 清洗为纯文本（用于估算字数） */
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 按语言统计「文本单元」数：CJK（如日语）按字符，其余按空格分词 */
+function countTextUnits(text: string, lang: string): number {
+  if (!text) return 0;
+  if (lang === 'ja' || lang === 'zh' || lang === 'ko') {
+    const m = text.match(/[぀-ヿ一-鿿]/g);
+    return m ? m.length : 0;
+  }
+  return text.split(/\s+/).filter((w) => w.length > 0).length;
+}
+
+/** 取某章字数：优先用已持久化的 wordCount，否则回退到本次会话估算的 ref */
+function weightOf(c: Chapter, map: Map<string, number>): number | undefined {
+  if (c.wordCount != null) return c.wordCount;
+  return map.get(c.href || '');
+}
+
+/**
+ * 基于字数加权的阅读进度。
+ * @param flat 扁平章节列表
+ * @param wordLookup 取某章字数（章节自带或会话缓存）
+ * @param currentIndex 当前章索引
+ * @param scrollPercent 当前章内滚动百分比 0-100
+ */
+function computeReadingProgress(
+  flat: Chapter[],
+  wordLookup: (c: Chapter) => number | undefined,
+  currentIndex: number,
+  scrollPercent: number
+): number {
+  const N = flat.length;
+  if (N === 0) return 0;
+  const weightAt = (i: number): number => {
+    const c = flat[i];
+    if (!c || c.type === 'frontmatter') return 0; // 信息页/致谢/版权/附录不计入正文
+    const w = wordLookup(c);
+    return w && w > 0 ? w : 1;
+  };
+  let total = 0;
+  const before: number[] = new Array(N);
+  let acc = 0;
+  for (let i = 0; i < N; i++) {
+    const w = weightAt(i);
+    total += w;
+    before[i] = acc;
+    acc += w;
+  }
+  if (total <= 0) {
+    // 全是卷首内容的极端情况：退回按序号比例
+    return Math.max(1, Math.min(100, Math.round(((currentIndex + 1) / N) * 100)));
+  }
+  const ci = Math.max(0, Math.min(N - 1, currentIndex));
+  const curW = weightAt(ci);
+  const frac = Math.max(0, Math.min(100, scrollPercent)) / 100;
+  const read = before[ci] + curW * frac;
+  return Math.max(1, Math.min(100, Math.round((read / total) * 100)));
+}
+
 // ============ 可滚动标题组件 ============
 
 function MarqueeTitle({
@@ -792,10 +870,37 @@ export function Reader({
       setChapterContent(contents.get(chapterId) || `第 ${index + 1} 章\n\n（暂无内容）`);
     }
 
-    // 保存阅读进度（通过回调通知父组件更新 React 状态，确保下次打开时记忆位置）
-    // 确保进度至少为 1（避免章节数 >100 时第一章进度四舍五入为 0）
-    const rawProgress = ((index + 1) / flatChapters.length) * 100;
-    const progress = Math.max(1, Math.min(100, Math.round(rawProgress)));
+    // 首次打开时估算当前章字数并缓存，使进度按真实字数加权（而非按章数）
+    // 采用懒计算 + 持久化：不在 getChapters() 里预统计（它每次开书都会跑，会拖慢开书）
+    if (chapter.href && chapter.wordCount == null && !wordCountsRef.current.has(chapter.href)) {
+      const htmlNow = contents.get(chapterId);
+      if (htmlNow && !htmlNow.includes('（暂无内容）')) {
+        const wc = countTextUnits(stripHtmlToText(htmlNow), book.language);
+        if (wc > 0) {
+          wordCountsRef.current.set(chapter.href, wc);
+          // 持久化到 DB，下次打开即带字数，不必重复估算
+          let changed = false;
+          const newChapters = (book.chapters || []).map((c) => {
+            if (c.id === chapter.id && c.wordCount == null) {
+              changed = true;
+              return { ...c, wordCount: wc };
+            }
+            return c;
+          });
+          if (changed) {
+            BookDB.update(book.id, { chapters: newChapters }).catch(() => {});
+          }
+        }
+      }
+    }
+
+    // 保存阅读进度：按字数加权（排除卷首/附录），当前章按滚动比例计入
+    const progress = computeReadingProgress(
+      flatChapters,
+      (c) => weightOf(c, wordCountsRef.current),
+      index,
+      0
+    );
     // 同步更新本地 ref，确保滚动保存和退出时使用最新进度
     bookProgressRef.current = progress;
     onUpdateProgress(book.id, progress, index);
@@ -844,7 +949,15 @@ export function Reader({
       scrollPosRef.current = Math.round(scrollPercent * 100);
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
       scrollSaveTimerRef.current = setTimeout(() => {
-        onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
+        // 按字数加权实时重算，使进度随当前章滚动比例平滑增长
+        const p = computeReadingProgress(
+          flatChaptersRef.current,
+          (c) => weightOf(c, wordCountsRef.current),
+          currentChapterRef.current,
+          scrollPosRef.current
+        );
+        bookProgressRef.current = p;
+        onUpdateProgress(book.id, p, currentChapterRef.current, scrollPosRef.current);
       }, 500);
       return;
     }
@@ -856,7 +969,15 @@ export function Reader({
     scrollPosRef.current = Math.round(scrollPercent * 100);
     if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
     scrollSaveTimerRef.current = setTimeout(() => {
-      onUpdateProgress(book.id, bookProgressRef.current, currentChapterRef.current, scrollPosRef.current);
+      // 按字数加权实时重算，使进度随当前章滚动比例平滑增长
+      const p = computeReadingProgress(
+        flatChaptersRef.current,
+        (c) => weightOf(c, wordCountsRef.current),
+        currentChapterRef.current,
+        scrollPosRef.current
+      );
+      bookProgressRef.current = p;
+      onUpdateProgress(book.id, p, currentChapterRef.current, scrollPosRef.current);
     }, 500);
   }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
@@ -896,6 +1017,8 @@ export function Reader({
   // 用 ref 保存关键 state，避免 onClick 闭包引用过期值
   const flatChaptersRef = useRef(flatChapters);
   flatChaptersRef.current = flatChapters;
+  // 本次会话内估算的各章字数（href -> 字数），用于按字数加权计算进度
+  const wordCountsRef = useRef<Map<string, number>>(new Map());
   const contentsRef = useRef(contents);
   contentsRef.current = contents;
   const parserRef = useRef(parser);
@@ -1987,8 +2110,13 @@ export function Reader({
                               latestContents.set(chId!, content.html);
                               setContents(new Map(latestContents));
                             }
-                            const rawProgress = ((idx + 1) / latestFlatChapters.length) * 100;
-                            const progress = Math.max(1, Math.min(100, Math.round(rawProgress)));
+                            // 按字数加权（排除卷首/附录），与切章/滚动保存保持一致
+                            const progress = computeReadingProgress(
+                              latestFlatChapters,
+                              (c) => weightOf(c, wordCountsRef.current),
+                              idx,
+                              0
+                            );
                             bookProgressRef.current = progress;
                             onUpdateProgress(book.id, progress, idx);
                             // 设置待滚动目标 — 高亮渲染 effect 会在 DOM 就绪后 scrollIntoView

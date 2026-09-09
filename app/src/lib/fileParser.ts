@@ -760,7 +760,7 @@ export class EPUBParser {
               href: href || undefined,
               level,
               type: classifyChapter(item.label),
-              isFrontMatter: false,
+              isFrontMatter: classifyChapter(item.label) === 'frontmatter',
             };
             // 递归处理子项（保留原始层级）
             if (item.subitems && item.subitems.length > 0) {
@@ -861,7 +861,7 @@ export class EPUBParser {
           href,
           level: 0,
           type: classifyChapter(finalTitle),
-          isFrontMatter: false,
+          isFrontMatter: classifyChapter(finalTitle) === 'frontmatter',
         });
       }
 
