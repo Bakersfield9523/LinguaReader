@@ -2926,10 +2926,13 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
     if (!target) continue;
     // ⚠️ 不能过滤「纯空白文本节点」：段落之间的换行正是靠它们承载。
     // 过滤掉会让跨段落的划选（"上一句\n下一句"）在归一化串里变成 "上一句下一句" 而永不命中。
+    // ⚠️ 也不能拒绝「已在别的 data-highlight-id 里」的节点：那样先划的高亮/下划线会把
+    // 后划的挡住 —— 下划线在底色词处断口、底色高亮在下划线区域永远划不上（4.4.11 截图实证）。
+    // 每次应用都从干净 HTML 重建，允许嵌套包裹即可共存：内层透明底/外层下划线互不遮挡。
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
       acceptNode(n: any) {
         if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
-        const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE' || (p.closest && p.closest('[data-highlight-id]')))) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -2975,8 +2978,14 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
         const a = i === si ? startLoc.offset : 0;
         const b = i === ei ? endLoc.offset + 1 : len;
         if (a >= b || a >= len) continue;
-        // 纯空白段（段落之间）不包裹：下划线类型会画出多余的孤立线段
-        if (!node.nodeValue.slice(a, b).trim()) continue;
+        // 纯空白段：段落/块级容器之间的换行不包裹（会画出孤立的 2px 短线）；
+        // 行内上下文里的空格（如 <span>word</span> <span>word</span> 之间）要包上，否则下划线断开。
+        if (!node.nodeValue.slice(a, b).trim()) {
+          const parentEl = node.parentElement as any;
+          const hasBlockChild = !!parentEl && Array.from(parentEl.children || []).some((c: any) =>
+            /^(DIV|P|SECTION|ARTICLE|LI|UL|OL|BLOCKQUOTE|TABLE|H[1-6]|FIGURE|ASIDE)$/i.test(c.tagName || ''));
+          if (hasBlockChild || !parentEl) continue;
+        }
         let targetNode = node;
         if (b < len) targetNode.splitText(b);
         if (a > 0) targetNode = targetNode.splitText(a);
