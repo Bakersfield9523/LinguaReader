@@ -25,10 +25,37 @@ import type { Book, WordMarker, DictionaryDefinition, ReaderSettings, Chapter, B
 // 新逻辑：以各章字数为权重（卷首/附录 frontmatter 权重为 0），当前章再按滚动比例计入，
 // 得到「读了整本书百分之多少」的真实进度。
 
-/** 取某章字数：优先用已持久化的 wordCount，否则回退到本次会话估算的 ref */
+/** 取某章字数：优先用已持久化的 wordCount，否则回退到本次会话估算的 ref。
+ *  ref 同时以 href 与 id 为键：TXT 等没有 href 的格式此前永远取不到字数，
+ *  全部章节回退成均值 → 退化为按章数等权 → 进度虚高。 */
 function weightOf(c: Chapter, map: Map<string, number>): number | undefined {
   if (c.wordCount != null) return c.wordCount;
-  return map.get(c.href || '');
+  const byHref = c.href ? map.get(c.href) : undefined;
+  if (byHref != null) return byHref;
+  return c.id ? map.get(c.id) : undefined;
+}
+
+/** 深拷贝章节树并写入某章字数（支持嵌套章节），返回新树与是否发生变更 */
+function withWordCountDeep(
+  list: Chapter[],
+  id: string,
+  wc: number,
+): { list: Chapter[]; changed: boolean } {
+  let changed = false;
+  const walk = (items: Chapter[]): Chapter[] =>
+    items.map((c) => {
+      if (c.id === id && c.wordCount == null) {
+        changed = true;
+        return { ...c, wordCount: wc };
+      }
+      if (c.children && c.children.length > 0) {
+        const kids = walk(c.children);
+        if (kids !== c.children) return { ...c, children: kids };
+      }
+      return c;
+    });
+  const next = walk(list);
+  return { list: next, changed };
 }
 
 /**
@@ -630,20 +657,8 @@ export function Reader({
           void (async () => {
             try {
               if (!isMounted) return;
-              if (parser instanceof EPUBParser) {
-                const needsScan = loadedChapters.some((c) => c.wordCount == null);
-                if (!needsScan) return;
-                const changed = await parser.estimateAllWordCounts(loadedChapters, book.language);
-                if (!changed || !isMounted) return;
-                const syncRef = (list: Chapter[]) => {
-                  for (const c of list) {
-                    if (c.href && c.wordCount != null) wordCountsRef.current.set(c.href, c.wordCount);
-                    if (c.children) syncRef(c.children);
-                  }
-                };
-                syncRef(loadedChapters);
-                await BookDB.update(book.id, { chapters: loadedChapters });
-                // 用当前位置重算一次进度，纠正虚高的旧值
+              // 用当前位置重算并回写进度（字数补齐后调用，用于纠正虚高旧值）
+              const recompute = () => {
                 const p = computeReadingProgress(
                   flatChaptersRef.current,
                   (c) => weightOf(c, wordCountsRef.current),
@@ -652,6 +667,50 @@ export function Reader({
                 );
                 bookProgressRef.current = p;
                 onUpdateProgress(book.id, p, currentChapterRef.current, scrollPosRef.current);
+              };
+              // 兜底：用「已加载的章节正文」给仍缺字数的章节计数。
+              // zip 直读失败（href 解析不到）或 TXT 这类无 href 的格式，全靠这条补上，
+              // 否则全书字数全空 → 退化为按章数等权 → 进度虚高。
+              const fillFromLoadedContent = async (): Promise<boolean> => {
+                let list = book.chapters || [];
+                let anyChanged = false;
+                for (const c of flatChaptersRef.current) {
+                  const key = c.href || c.id;
+                  if (!key || c.wordCount != null || wordCountsRef.current.has(key)) continue;
+                  const html = contentsRef.current.get(c.id);
+                  if (!html || html.includes('（暂无内容）')) continue;
+                  const n = countTextUnits(stripHtmlToText(html), book.language);
+                  if (n <= 0) continue;
+                  wordCountsRef.current.set(key, n);
+                  const res = withWordCountDeep(list, c.id, n);
+                  list = res.list;
+                  anyChanged = anyChanged || res.changed;
+                }
+                if (anyChanged) await BookDB.update(book.id, { chapters: list });
+                return anyChanged;
+              };
+
+              if (parser instanceof EPUBParser) {
+                let scanChanged = false;
+                const needsScan = loadedChapters.some((c) => c.wordCount == null);
+                if (needsScan) {
+                  scanChanged = await parser.estimateAllWordCounts(loadedChapters, book.language);
+                  if (scanChanged && isMounted) {
+                    const syncRef = (list: Chapter[]) => {
+                      for (const c of list) {
+                        const k = c.href || c.id;
+                        if (k && c.wordCount != null) wordCountsRef.current.set(k, c.wordCount);
+                        if (c.children) syncRef(c.children);
+                      }
+                    };
+                    syncRef(loadedChapters);
+                    await BookDB.update(book.id, { chapters: loadedChapters });
+                  }
+                }
+                // zip 直读可能整本失败（href 解析不到）→ 再用已加载内容兜底一次
+                const filled = await fillFromLoadedContent();
+                if (!isMounted) return;
+                if (scanChanged || filled) recompute();
               } else if (parser instanceof PDFParser) {
                 pageCountsRef.current = book.pageWordCounts || [];
                 if (pageCountsRef.current.length) return; // 已有统计，直接跳过
@@ -668,6 +727,11 @@ export function Reader({
                   bookProgressRef.current = p;
                   onUpdateProgress(book.id, p, currentChapterRef.current);
                 }
+              } else {
+                // TXT 等纯文本格式：没有 zip 可扫，直接用已加载正文补字数
+                const filled = await fillFromLoadedContent();
+                if (!isMounted) return;
+                if (filled) recompute();
               }
             } catch {
               // 静默失败，不影响阅读
@@ -755,24 +819,27 @@ export function Reader({
 
     // 首次打开时估算当前章字数并缓存，使进度按真实字数加权（而非按章数）
     // 采用懒计算 + 持久化：不在 getChapters() 里预统计（它每次开书都会跑，会拖慢开书）
-    if (chapter.href && chapter.wordCount == null && !wordCountsRef.current.has(chapter.href)) {
+    // 键同时支持 href 与 id（TXT 无 href），否则这些章节永远拿不到字数 → 进度退化成按章数
+    const countKey = chapter.href || chapter.id;
+    if (countKey && chapter.wordCount == null && !wordCountsRef.current.has(countKey)) {
       const htmlNow = contents.get(chapterId);
       if (htmlNow && !htmlNow.includes('（暂无内容）')) {
         const wc = countTextUnits(stripHtmlToText(htmlNow), book.language);
         if (wc > 0) {
-          wordCountsRef.current.set(chapter.href, wc);
-          // 持久化到 DB，下次打开即带字数，不必重复估算
-          let changed = false;
-          const newChapters = (book.chapters || []).map((c) => {
-            if (c.id === chapter.id && c.wordCount == null) {
-              changed = true;
-              return { ...c, wordCount: wc };
-            }
-            return c;
-          });
+          wordCountsRef.current.set(countKey, wc);
+          // 持久化到 DB，下次打开即带字数，不必重复估算（深拷贝以兼容嵌套章节）
+          const { list, changed } = withWordCountDeep(book.chapters || [], chapter.id, wc);
           if (changed) {
-            BookDB.update(book.id, { chapters: newChapters }).catch(() => {});
+            BookDB.update(book.id, { chapters: list }).catch(() => {});
           }
+          // 拿到新字数后立刻重算，纠正之前按章数等权造成的虚高
+          const pNow = computeReadingProgress(
+            flatChapters,
+            (c) => weightOf(c, wordCountsRef.current),
+            index,
+            scrollPosRef.current
+          );
+          bookProgressRef.current = pNow;
         }
       }
     }
@@ -2857,9 +2924,11 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
     // 这里先把目标空白归一化，再在"跨节点拼接的归一化串"里匹配，映射回 DOM 逐段包裹。
     const target = it.text.replace(/\s+/g, ' ').trim();
     if (!target) continue;
+    // ⚠️ 不能过滤「纯空白文本节点」：段落之间的换行正是靠它们承载。
+    // 过滤掉会让跨段落的划选（"上一句\n下一句"）在归一化串里变成 "上一句下一句" 而永不命中。
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
       acceptNode(n: any) {
-        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
         const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE' || (p.closest && p.closest('[data-highlight-id]')))) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
@@ -2906,6 +2975,8 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
         const a = i === si ? startLoc.offset : 0;
         const b = i === ei ? endLoc.offset + 1 : len;
         if (a >= b || a >= len) continue;
+        // 纯空白段（段落之间）不包裹：下划线类型会画出多余的孤立线段
+        if (!node.nodeValue.slice(a, b).trim()) continue;
         let targetNode = node;
         if (b < len) targetNode.splitText(b);
         if (a > 0) targetNode = targetNode.splitText(a);

@@ -153,6 +153,27 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     markedSetRef.current = new Set((wordMarkers || []).map(w => normMatch(w.word)));
   }, [wordMarkers]);
 
+  /**
+   * 读取本页高亮并解析为词索引区间（供覆盖层绘制）。
+   * 渲染流程与 highlightVersion 变化两条路径共用，避免两处逻辑漂移。
+   */
+  const loadHighlightEntries = useCallback(async (words: WordBox[]): Promise<HlEntry[]> => {
+    if (!bookId || !words || words.length === 0) return [];
+    try {
+      const all = await HighlightDB.getByBookId(bookId);
+      const pageHls = all.filter(h => h.chapterIndex === chapterIndex);
+      const entries: HlEntry[] = [];
+      for (const h of pageHls) {
+        if (!h.text && h.startIndex == null) continue;
+        const r = resolveHighlightRange(words, h);
+        if (r) entries.push({ range: r, type: (h.type as 'underline' | 'highlight') || 'highlight' });
+      }
+      return entries;
+    } catch {
+      return [];
+    }
+  }, [bookId, chapterIndex]);
+
   // Load saved highlights from DB into ref
   useEffect(() => {
     if (!bookId) { hlEntriesRef.current = []; return; }
@@ -164,21 +185,24 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         await new Promise(r => setTimeout(r, 120));
         if (cancelled) return;
         words = wordsRef.current;
-        if (!words || words.length === 0) return;
+        if (!words || words.length === 0) {
+          // 词框尚未就绪（首次渲染较慢）：打标记，等渲染流程完成后再补一次加载
+          pendingHighlightReloadRef.current = true;
+          return;
+        }
       }
 
       try {
-        const all = await HighlightDB.getByBookId(bookId);
+        const entries = await loadHighlightEntries(words);
         if (cancelled) return;
-        const pageHls = all.filter(h => h.chapterIndex === chapterIndex);
-        const entries: HlEntry[] = [];
-        for (const h of pageHls) {
-          if (!h.text && h.startIndex == null) continue;
-          const r = resolveHighlightRange(words, h);
-          if (r) entries.push({ range: r, type: (h.type as 'underline' | 'highlight') || 'highlight' });
-        }
         hlEntriesRef.current = entries;
-        // 重绘由 [highlightVersion] useLayoutEffect 统一负责，避免重复
+        pendingHighlightReloadRef.current = false;
+        // ⚠️ 必须在此主动重绘：[highlightVersion] 的 layout effect 早于本异步加载完成
+        // （layout 先于 passive 执行），不补这一下，新建的高亮/下划线要等翻页或缩放才画出来。
+        if (wordsRef.current.length > 0 && overlayContainerRef.current) {
+          overlayContainerRef.current.innerHTML = '';
+          drawAllOverlays();
+        }
       } catch {
         /* ignore */
       }
@@ -311,17 +335,9 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
             textSpansRef.current = [];
           }
           // Re-match highlights with new words
-          let entries: HlEntry[] = [];
-          if (bookId) {
-            const all = await HighlightDB.getByBookId(bookId);
-            if (cancelled || generation !== renderGenerationRef.current) return;
-            const pageHls = all.filter(h => h.chapterIndex === chapterIndex);
-            for (const h of pageHls) {
-              if ((!h.text && h.startIndex == null) || !builtWords.length) continue;
-              const r = resolveHighlightRange(builtWords, h);
-              if (r) entries.push({ range: r, type: (h.type as 'underline' | 'highlight') || 'highlight' });
-            }
-          }
+          // （若之前因词框未就绪而挂起过加载，这里统一补上）
+          const entries: HlEntry[] = await loadHighlightEntries(builtWords);
+          if (cancelled || generation !== renderGenerationRef.current) return;
           if (cancelled || generation !== renderGenerationRef.current) return;
           wordsRef.current = builtWords;
           hlEntriesRef.current = entries;
@@ -1240,6 +1256,19 @@ function resolveHighlightRange(
     h.endIndex >= h.startIndex &&
     h.endIndex < words.length
   ) {
+    // 锚点校验：该区间拼出的文本若与保存文本对不上（词切分变化 / 索引陈旧 / 缩放重建后
+    // 词序不同），说明锚点已失效 —— 退回文本匹配，避免"画在别处"或"干脆不画"。
+    if (h.text) {
+      const norm = (s: string) =>
+        s.toLowerCase()
+          .replace(/[\s\u00AD\u200B-\u200F\u2060\uFEFF]+/g, ' ')
+          .replace(/[\p{P}\p{S}]/gu, '')
+          .trim();
+      const joined = words.slice(h.startIndex, h.endIndex + 1).map(w => w.text).join(' ');
+      const nj = norm(joined);
+      const nt = norm(h.text);
+      if (nj && nt && !nj.includes(nt)) return findRange(words, h.text);
+    }
     return [h.startIndex, h.endIndex];
   }
   if (h.text) return findRange(words, h.text);
