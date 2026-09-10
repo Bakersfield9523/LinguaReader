@@ -554,6 +554,26 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       }
     }
 
+    // 底色高亮的实体矩形兜底：Highlight API 依赖 TextLayer 的 span 对齐，
+    // 一旦某个词映射不到 span（itemIdx 错位 / 文字层异常），该高亮就整体不显示。
+    // 下划线走的正是矩形路径所以一直正常，底色这里补同样的兜底。
+    const unmatchedHl: HlEntry[] = [];
+    const pushHighlightRects = () => {
+      for (const entry of unmatchedHl) {
+        const [s, e] = entry.range;
+        const indices: number[] = [];
+        for (let i = s; i <= e && i < words.length; i++) indices.push(i);
+        pushMergedSegments(indices, (first, last) => {
+          const ov = wordOverflow(last.h);
+          const top = Math.round(first.y - ov.padTop);
+          const left = Math.round(first.x - ov.padLeft);
+          const width = Math.max(2, Math.round(last.x + last.w - first.x) + ov.padW);
+          const height = Math.max(6, Math.round(last.y + last.h - first.y) + ov.padH);
+          return `<div style="position:absolute;pointer-events:none;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(229,163,73,0.55);border-radius:2px;z-index:1;"></div>`;
+        });
+      }
+    };
+
     if (useHighlight) {
       // ── 路线 B：CSS Custom Highlight API 精确染色（零 side-bearing 缝隙，Koodo 效果）──
       // 仅负责"底色"类：background-color 是 Highlight API 稳定绘制的属性。
@@ -561,7 +581,12 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       const hlRanges: Range[] = [];
       for (const entry of hlEntries) {
         if (entry.type === 'underline') continue;
-        hlRanges.push(...rangesForRange(entry.range[0], entry.range[1]));
+        const rs = rangesForRange(entry.range[0], entry.range[1]);
+        // 必须每个词都映射到 TextLayer 的 span，少一个就会"高亮缺一块"；
+        // 缺任何一块都整体退回实体矩形，避免出现半截底色。
+        const expected = Math.max(0, Math.min(entry.range[1], words.length - 1) - entry.range[0] + 1);
+        if (rs.length >= expected && expected > 0) hlRanges.push(...rs);
+        else unmatchedHl.push(entry);
       }
       const markRanges = rangesForIndices(markedIndices);
       const sel = selRangeRef.current;
@@ -573,8 +598,9 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       if (typeof window !== 'undefined' && (window as any).__pdfDebug !== false) {
         console.log('[PDF overlay] highlight ranges: hl=%d mark=%d sel=%d', hlRanges.length, markRanges.length, selRanges.length);
       }
-      // 底色高亮由 CSS.highlights 显示；下划线 + 链接区仍需写入 overlay DOM
+      // 底色高亮由 CSS.highlights 显示；映射失败的部分 + 下划线 + 链接区写入 overlay DOM
       pushUnderlines();
+      pushHighlightRects();
       container.innerHTML = [...parts, ...linkParts].join('');
       return;
     }

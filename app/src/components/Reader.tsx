@@ -2888,6 +2888,19 @@ function iframeMarkFootnoteRefs(doc: Document) {
 }
 function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
   if (!wordsSet || !wordsSet.size) return;
+  // ⚠️ 关键：生词本里可能存的是「多词短语」（选中多个词后点查看解析就会整段入库）。
+  // 单词级 token 匹配（wordsSet.has(单token)）对短语永远命中不了 → "标记超过一个单词就没有高亮"。
+  // 因此拆成两条路：单词走原 token 匹配，短语走与划线同款的"跨节点归一化整段匹配"。
+  const matched = new Set<string>();
+  const singles = new Set<string>();
+  const phrases: string[] = [];
+  for (const w of wordsSet) {
+    const t = (w || '').replace(/\s+/g, ' ').trim();
+    if (!t) continue;
+    if (/\s/.test(t)) { phrases.push(t); continue; }
+    const cleaned = t.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
+    if (cleaned) singles.add(cleaned);
+  }
   const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
     acceptNode(n: any) {
       if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
@@ -2904,7 +2917,8 @@ function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
       if (!part) continue;
       if (/[\p{L}\p{M}]/u.test(part)) {
         const clean = part.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
-        if (clean && wordsSet.has(clean) && clean.length >= 2) {
+        if (clean && singles.has(clean) && clean.length >= 2) {
+          matched.add(clean);
           const m = doc.createElement('mark'); m.className = 'vocab-mark'; m.textContent = part; frag.appendChild(m); changed = true; continue;
         }
       }
@@ -2912,7 +2926,52 @@ function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
     }
     if (changed) node.parentNode.replaceChild(frag, node);
   }
+  // 单词级没命中的条目也要走一遍整段匹配：
+  //  · 多词短语（选了多个词再标记）—— 本来就只能整段匹配；
+  //  · 中文/日文条目 —— 正文里整段汉字/假名之间没有分隔符，token 级永远等于整句而匹配不上。
+  const leftovers: string[] = [];
+  for (const s of singles) if (!matched.has(s)) leftovers.push(s);
+  const candidates = phrases.concat(leftovers).sort((a, b) => b.length - a.length).slice(0, 128);
+  if (candidates.length) iframeApplyPhraseMarks(doc, candidates);
 }
+
+/** 多词短语标记：整段包裹为 <mark class="vocab-mark">，与划线共用归一化匹配基础设施 */
+function iframeApplyPhraseMarks(doc: Document, phrases: string[]) {
+  const sorted = phrases.slice().sort((a, b) => b.length - a.length);
+  // 先用「一份」索引批量筛掉本章根本不存在的条目（重建索引是 O(正文长度)，
+  // 生词本动辄上百条，逐条重建会把开书卡住）；真正要包裹的通常只有个位数。
+  const usable: string[] = [];
+  {
+    const probe = collectNormIndex(doc);
+    if (!probe.nodes.length) return;
+    for (const p of sorted) if (resolveNormHits(probe, p, true)) usable.push(p);
+  }
+  for (const p of usable) {
+    try {
+      const idx = collectNormIndex(doc);
+      if (!idx.nodes.length) continue;
+      const res = resolveNormHits(idx, p, true);
+      if (!res) continue;
+      wrapNormMatches(idx, res.locs, res.hits, () => {
+        const m = doc.createElement('mark');
+        m.className = 'vocab-mark';
+        return m;
+      }, (tn) => {
+        // 已在别的标记里（例如该短语里的某个单词单独被标记过）→ 不再嵌套，避免重复描边
+        let pe = tn.parentElement as any;
+        while (pe) { if (pe.tagName === 'MARK') return true; pe = pe.parentElement; }
+        return false;
+      });
+    } catch { /* ignore */ }
+  }
+}
+/** 前一个有效兄弟节点是不是 <br>（行内换行，选区里会呈现为空白，但源码没有空白节点） */
+function prevSiblingIsBr(node: any): boolean {
+  let s = node && node.previousSibling;
+  while (s && s.nodeType === 3 && !(s.nodeValue || '').trim()) s = s.previousSibling;
+  return !!s && s.nodeType === 1 && s.tagName === 'BR';
+}
+
 /** 取文本节点所在的块级容器（用于判断"块边界"），找不到则返回兜底元素 */
 const HL_BLOCK_TAGS = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|CAPTION|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL|BODY)$/i;
 function blockAncestorOf(node: any, fallback: any): any {
@@ -2922,6 +2981,147 @@ function blockAncestorOf(node: any, fallback: any): any {
     p = p.parentElement;
   }
   return fallback;
+}
+
+// ============ 跨节点归一化匹配：划线 / 多词标记 共用 ============
+type NormLoc = { node: any; offset: number };
+type NormIndex = {
+  nodes: any[];
+  nodeIndex: Map<any, number>;
+  normText: string; locs: NormLoc[];
+  normBare: string; locsBare: NormLoc[];
+  normFlat: string; locsFlat: NormLoc[];
+  // 小写孪生串（长度与上面严格一致，故共用同一套 locs）——短语标记需要忽略大小写
+  normTextL: string; normBareL: string; normFlatL: string;
+};
+/** 逐字符小写，保证长度不变（否则 locs 下标映射会错位） */
+function chLower(c: string): string { const lo = c.toLowerCase(); return lo.length === c.length ? lo : c; }
+
+function collectNormIndex(doc: Document): NormIndex {
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(n: any) {
+      if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+      const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const nodes: any[] = []; let nd: any; while ((nd = walker.nextNode())) nodes.push(nd);
+  const nodeIndex = new Map<any, number>();
+  nodes.forEach((n, i) => nodeIndex.set(n, i));
+  let normText = '', normBare = '', normFlat = '';
+  let normTextL = '', normBareL = '', normFlatL = '';
+  const locs: NormLoc[] = [];
+  const locsBare: NormLoc[] = [];
+  const locsFlat: NormLoc[] = [];
+  let pendingSpace = false;
+  let prevBlock: any;
+  for (const node of nodes) {
+    const v: string = node.nodeValue || '';
+    const blk = blockAncestorOf(node, doc.body);
+    if (prevBlock !== undefined && blk !== prevBlock) pendingSpace = true;
+    else if (prevBlock !== undefined && prevSiblingIsBr(node)) pendingSpace = true;
+    for (let k = 0; k < v.length; k++) {
+      if (/\s/.test(v[k])) { pendingSpace = true; continue; }
+      if (pendingSpace && normText.length > 0) {
+        normText += ' '; normTextL += ' '; locs.push({ node, offset: k });
+        if (normBare.length > 0) { normBare += ' '; normBareL += ' '; locsBare.push({ node, offset: k }); }
+      }
+      pendingSpace = false;
+      const c = v[k], cl = chLower(c);
+      normText += c; normTextL += cl; locs.push({ node, offset: k });
+      if (!/[\p{P}\p{S}]/u.test(c)) {
+        normBare += c; normBareL += cl; locsBare.push({ node, offset: k });
+        normFlat += c; normFlatL += cl; locsFlat.push({ node, offset: k });
+      }
+    }
+    if (v.length > 0) prevBlock = blk;
+  }
+  return { nodes, nodeIndex, normText, locs, normBare, locsBare, normFlat, locsFlat, normTextL, normBareL, normFlatL };
+}
+
+function findHits(hay: string, needle: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  if (!needle) return out;
+  let f = 0;
+  while (true) {
+    const i = hay.indexOf(needle, f);
+    if (i < 0) break;
+    out.push([i, i + needle.length]);
+    f = i + needle.length;
+  }
+  return out;
+}
+
+/** 三层兜底匹配：精确 → 去标点 → 去标点去空白，返回命中的 locs 与区间 */
+function resolveNormHits(
+  idx: NormIndex,
+  rawTarget: string,
+  ignoreCase = false,
+): { locs: NormLoc[]; hits: Array<[number, number]> } | null {
+  const target = (rawTarget || '').replace(/\s+/g, ' ').trim();
+  if (!target) return null;
+  const T = ignoreCase ? target.toLowerCase() : target;
+  let hits = findHits(ignoreCase ? idx.normTextL : idx.normText, T);
+  let locs = idx.locs;
+  if (!hits.length) {
+    const bareT = T.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
+    if (bareT) {
+      const h = findHits(ignoreCase ? idx.normBareL : idx.normBare, bareT);
+      if (h.length) { hits = h; locs = idx.locsBare; }
+    }
+  }
+  if (!hits.length) {
+    const flatT = T.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, '');
+    if (flatT) {
+      const h = findHits(ignoreCase ? idx.normFlatL : idx.normFlat, flatT);
+      if (h.length) { hits = h; locs = idx.locsFlat; }
+    }
+  }
+  return hits.length ? { locs, hits } : null;
+}
+
+/** 把归一化命中区间映射回原文并逐段用 make() 生成的元素包裹；返回实际包裹段数 */
+function wrapNormMatches(
+  idx: NormIndex,
+  locs: NormLoc[],
+  hits: Array<[number, number]>,
+  make: () => any,
+  skip?: (targetNode: any) => boolean,
+): number {
+  let applied = 0;
+  for (let h = hits.length - 1; h >= 0; h--) {
+    const startLoc = locs[hits[h][0]];
+    const endLoc = locs[hits[h][1] - 1];
+    if (!startLoc || !endLoc) continue;
+    const si = idx.nodeIndex.get(startLoc.node);
+    const ei = idx.nodeIndex.get(endLoc.node);
+    if (si == null || ei == null || ei < si) continue;
+    for (let i = ei; i >= si; i--) {
+      const node = idx.nodes[i];
+      const len: number = node.nodeValue.length;
+      const a = i === si ? startLoc.offset : 0;
+      const b = i === ei ? endLoc.offset + 1 : len;
+      if (a >= b || a >= len) continue;
+      // 纯空白段：段落/块级容器之间的换行不包裹（会画出孤立的 2px 短线）；
+      // 行内上下文里的空格（如 <span>word</span> <span>word</span> 之间）要包上，否则下划线断开。
+      if (!node.nodeValue.slice(a, b).trim()) {
+        const parentEl = node.parentElement as any;
+        const hasBlockChild = !!parentEl && Array.from(parentEl.children || []).some((c: any) =>
+          /^(DIV|P|SECTION|ARTICLE|LI|UL|OL|BLOCKQUOTE|TABLE|H[1-6]|FIGURE|ASIDE)$/i.test(c.tagName || ''));
+        if (hasBlockChild || !parentEl) continue;
+      }
+      let targetNode = node;
+      if (b < len) targetNode.splitText(b);
+      if (a > 0) targetNode = targetNode.splitText(a);
+      if (!targetNode.parentNode) continue;
+      if (skip && skip(targetNode)) continue;
+      const el = make();
+      targetNode.parentNode.replaceChild(el, targetNode);
+      el.appendChild(targetNode);
+      applied++;
+    }
+  }
+  return applied;
 }
 
 /** 兜底：旧版"单节点内精确匹配"（4.4.9 起的行为），保证新逻辑失手时不会比旧版更差 */
@@ -2967,108 +3167,21 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
     // 保留原始空白（换行/缩进），且多词短语常被 <i>/<b>/<a>/<mark> 等行内元素切成
     // 多个文本节点 —— 旧实现只在单个节点内精确 indexOf，多词高亮/下划线永远匹配不上。
     // 这里先把目标空白归一化，再在"跨节点拼接的归一化串"里匹配，映射回 DOM 逐段包裹。
-    const target = it.text.replace(/\s+/g, ' ').trim();
-    if (!target) continue;
-    // ⚠️ 不能过滤「纯空白文本节点」：段落之间的换行正是靠它们承载。
-    // 过滤掉会让跨段落的划选（"上一句\n下一句"）在归一化串里变成 "上一句下一句" 而永不命中。
+    // ⚠️ 不能过滤「纯空白文本节点」：段落之间的换行正是靠它们承载（见 collectNormIndex）。
     // ⚠️ 也不能拒绝「已在别的 data-highlight-id 里」的节点：那样先划的高亮/下划线会把
     // 后划的挡住 —— 下划线在底色词处断口、底色高亮在下划线区域永远划不上（4.4.11 截图实证）。
     // 每次应用都从干净 HTML 重建，允许嵌套包裹即可共存：内层透明底/外层下划线互不遮挡。
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-      acceptNode(n: any) {
-        if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
-        const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
+    const idx = collectNormIndex(doc);
+    if (!idx.nodes.length) continue;
+    const res = resolveNormHits(idx, it.text);
+    if (!res) { iframeApplyHighlightLegacy(doc, it); continue; }
+    const applied = wrapNormMatches(idx, res.locs, res.hits, () => {
+      const span = doc.createElement('span');
+      span.setAttribute('data-highlight-id', it.id);
+      span.setAttribute('data-hl-type', it.type === 'underline' ? 'underline' : 'highlight');
+      span.className = 'user-highlight';
+      return span;
     });
-    const nodes: any[] = []; let nd: any; while (nd = walker.nextNode()) nodes.push(nd);
-    if (!nodes.length) continue;
-
-    // 归一化拼接 + 下标映射（折叠出的空格映射到其右侧首个非空白字符位置，
-    // 使命中区间映射回原始文本时能把中间的空白/换行一并覆盖）。
-    // 同时构建「去标点版」，作为精确匹配失手时的兜底（ curly quote / 连字符等差异）。
-    // ⚠️ 关键：跨块级元素边界（</p><p> 紧挨、中间没有空白文本节点时）也要补一个空格——
-    // 浏览器 Selection.toString() 按渲染结果给文本，段落之间会带换行，而源码里没有，
-    // 不补这个空格，"划一整段/几段"的选区永远匹配不上（4.4.12 用户反馈的根因）。
-    let normText = '';
-    let normBare = '';
-    const locs: Array<{ node: any; offset: number }> = [];
-    const locsBare: Array<{ node: any; offset: number }> = [];
-    let pendingSpace = false;
-    let prevBlock: any;
-    for (const node of nodes) {
-      const v: string = node.nodeValue || '';
-      const blk = blockAncestorOf(node, doc.body);
-      if (prevBlock !== undefined && blk !== prevBlock) pendingSpace = true;
-      for (let k = 0; k < v.length; k++) {
-        if (/\s/.test(v[k])) { pendingSpace = true; continue; }
-        if (pendingSpace && normText.length > 0) {
-          normText += ' '; locs.push({ node, offset: k });
-          if (normBare.length > 0) { normBare += ' '; locsBare.push({ node, offset: k }); }
-        }
-        pendingSpace = false;
-        normText += v[k]; locs.push({ node, offset: k });
-        if (!/[\p{P}\p{S}]/u.test(v[k])) { normBare += v[k]; locsBare.push({ node, offset: k }); }
-      }
-      if (v.length > 0) prevBlock = blk;
-    }
-
-    const findHits = (hay: string, needle: string): Array<[number, number]> => {
-      const out: Array<[number, number]> = [];
-      if (!needle) return out;
-      let f = 0;
-      while (true) {
-        const i = hay.indexOf(needle, f);
-        if (i < 0) break;
-        out.push([i, i + needle.length]);
-        f = i + needle.length;
-      }
-      return out;
-    };
-    const bareTarget = target.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
-    let hits = findHits(normText, target);
-    let useLocs = locs;
-    if (!hits.length && bareTarget) {
-      hits = findHits(normBare, bareTarget);
-      if (hits.length) useLocs = locsBare;
-    }
-    const nodeIndex = new Map<any, number>();
-    nodes.forEach((n, i) => nodeIndex.set(n, i));
-    let applied = 0;
-    for (let h = hits.length - 1; h >= 0; h--) {
-      const startLoc = useLocs[hits[h][0]];
-      const endLoc = useLocs[hits[h][1] - 1];
-      if (!startLoc || !endLoc) continue;
-      const si = nodeIndex.get(startLoc.node);
-      const ei = nodeIndex.get(endLoc.node);
-      if (si == null || ei == null || ei < si) continue;
-      for (let i = ei; i >= si; i--) {
-        const node = nodes[i];
-        const len: number = node.nodeValue.length;
-        const a = i === si ? startLoc.offset : 0;
-        const b = i === ei ? endLoc.offset + 1 : len;
-        if (a >= b || a >= len) continue;
-        // 纯空白段：段落/块级容器之间的换行不包裹（会画出孤立的 2px 短线）；
-        // 行内上下文里的空格（如 <span>word</span> <span>word</span> 之间）要包上，否则下划线断开。
-        if (!node.nodeValue.slice(a, b).trim()) {
-          const parentEl = node.parentElement as any;
-          const hasBlockChild = !!parentEl && Array.from(parentEl.children || []).some((c: any) =>
-            /^(DIV|P|SECTION|ARTICLE|LI|UL|OL|BLOCKQUOTE|TABLE|H[1-6]|FIGURE|ASIDE)$/i.test(c.tagName || ''));
-          if (hasBlockChild || !parentEl) continue;
-        }
-        let targetNode = node;
-        if (b < len) targetNode.splitText(b);
-        if (a > 0) targetNode = targetNode.splitText(a);
-        if (!targetNode.parentNode) continue;
-        const span = doc.createElement('span');
-        span.setAttribute('data-highlight-id', it.id);
-        span.setAttribute('data-hl-type', it.type === 'underline' ? 'underline' : 'highlight');
-        span.className = 'user-highlight';
-        targetNode.parentNode.replaceChild(span, targetNode);
-        span.appendChild(targetNode);
-        applied++;
-      }
-    }
     // 新逻辑一处都没包上 → 退回旧版单节点精确匹配，保证表现不比旧版差
     if (applied === 0) iframeApplyHighlightLegacy(doc, it);
    } catch {
@@ -3144,6 +3257,7 @@ function parseHtmlToReact(
       const v: string = nd.nodeValue || '';
       const blk = blockAncestorOf(nd, tempDiv);
       if (prevBlock !== undefined && blk !== prevBlock) pendingSpace = true;
+      else if (prevBlock !== undefined && prevSiblingIsBr(nd)) pendingSpace = true;
       for (let k = 0; k < v.length; k++) {
         if (/\s/.test(v[k])) { pendingSpace = true; continue; }
         if (pendingSpace && plainText.length > 0) {
@@ -3192,6 +3306,52 @@ function parseHtmlToReact(
       }
     }
   }
+  // 多词「标记」：生词本里存的是短语时，token 级匹配（renderWordsWithMark）永远命中不了，
+  // 与 iframe 路径保持一致 —— 用同一套归一化整段匹配补一段 vocab-mark 区间。
+  {
+    // 正文里真实出现过的 token（清洗后）：能整 token 命中的交给 renderWordsWithMark，
+    // 命中不了的（多词短语 / 中文日文这类无分隔写法）才走整段匹配。
+    const presentTokens = new Set<string>();
+    for (const tk of plainText.split(/[^\p{L}\p{M}\u2010-\u2015']+/gu)) {
+      if (!tk) continue;
+      const c = tk.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
+      if (c) presentTokens.add(c);
+    }
+    const phraseMarks: string[] = [];
+    for (const w of markedWords) {
+      const t = (w || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      const cleaned = t.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
+      if (cleaned.length >= 2 && !presentTokens.has(cleaned)) phraseMarks.push(t);
+    }
+    const plainLower = plainText.toLowerCase();
+    const bareLower = plainBare.toLowerCase();
+    for (const p of phraseMarks.sort((a, b) => b.length - a.length)) {
+      const t = p.replace(/\s+/g, ' ').trim();
+      let rawRanges = matchAll(plainText, t, normToRaw);
+      if (rawRanges.length === 0 && plainLower.length === plainText.length) {
+        rawRanges = matchAll(plainLower, t.toLowerCase(), normToRaw);
+      }
+      if (rawRanges.length === 0) {
+        const bareT = t.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
+        if (bareT) {
+          rawRanges = matchAll(plainBare, bareT, bareToRaw);
+          if (rawRanges.length === 0 && bareLower.length === plainBare.length) {
+            rawRanges = matchAll(bareLower, bareT.toLowerCase(), bareToRaw);
+          }
+        }
+      }
+      for (const [rawStart, rawEnd] of rawRanges) {
+        const overlapped = hlRanges.some(r =>
+          (rawStart >= r.start && rawStart < r.end) || (rawEnd > r.start && rawEnd <= r.end) ||
+          (rawStart <= r.start && rawEnd >= r.end)
+        );
+        if (!overlapped) {
+          hlRanges.push({ start: rawStart, end: rawEnd, id: `mk-${rawStart}-${rawEnd}`, hasNote: false, type: 'mark' });
+        }
+      }
+    }
+  }
   hlRanges.sort((a, b) => a.start - b.start);
 
   // 2) 用 React.createElement 构造节点（不用 JSX，避免 react-jsx 运行时误报 hooks 误用）
@@ -3212,21 +3372,35 @@ function parseHtmlToReact(
         segs.push(renderWordsWithMark(before, pos, null));
       }
       const inHl = text.slice(Math.max(r.start, pos) - basePlainStart, r.end - basePlainStart);
-      const hlInner: React.ReactNode[] = [renderWordsWithMark(inHl, Math.max(r.start, pos), r.id)];
-      if (r.hasNote) {
+      const isMark = r.type === 'mark';
+      const hlInner: React.ReactNode[] = [renderWordsWithMark(inHl, Math.max(r.start, pos), isMark ? null : r.id, isMark)];
+      if (r.hasNote && !isMark) {
         hlInner.push(React.createElement('span', {
           key: `nd-${r.id}-${basePlainStart}`,
           style: { color: '#e5a349', fontSize: '0.85em' },
         }, ' •'));
       }
-      segs.push(React.createElement('span', {
-        key: `hl-${r.id}-${basePlainStart}`,
-        'data-highlight-id': r.id,
-        // data-hl-type 供 CSS 区分"下划线/底色高亮"；样式由 App.css 的 !important 规则兜底，
-        // 避免书籍自带 CSS（.reader-html-content span 之类，特异性更高）把下划线边框覆盖掉。
-        'data-hl-type': r.type === 'underline' ? 'underline' : 'highlight',
-        className: 'reader-hl cursor-pointer hover:bg-[#e5a349]/10 transition-colors',
-      }, ...hlInner));
+      if (isMark) {
+        segs.push(React.createElement('mark', {
+          key: `mk-${r.id}-${basePlainStart}`,
+          className: 'vocab-mark cursor-pointer',
+          style: {
+            backgroundColor: 'rgba(229,163,73,0.3)',
+            borderBottom: '2px solid #e5a349',
+            padding: '0 2px',
+            borderRadius: '2px',
+          },
+        }, ...hlInner));
+      } else {
+        segs.push(React.createElement('span', {
+          key: `hl-${r.id}-${basePlainStart}`,
+          'data-highlight-id': r.id,
+          // data-hl-type 供 CSS 区分"下划线/底色高亮"；样式由 App.css 的 !important 规则兜底，
+          // 避免书籍自带 CSS（.reader-html-content span 之类，特异性更高）把下划线边框覆盖掉。
+          'data-hl-type': r.type === 'underline' ? 'underline' : 'highlight',
+          className: 'reader-hl cursor-pointer hover:bg-[#e5a349]/10 transition-colors',
+        }, ...hlInner));
+      }
       pos = r.end;
     }
     if (pos < basePlainStart + text.length) {
@@ -3240,6 +3414,7 @@ function parseHtmlToReact(
     text: string,
     plainStart: number,
     _hlId: string | null,
+    suppressWordMark = false,
   ): React.ReactNode {
     if (!text) return null;
     const parts = text.split(/([^\p{L}\p{M}\u2010-\u2015']+)/gu);
@@ -3253,7 +3428,7 @@ function parseHtmlToReact(
         continue;
       }
       const clean = part.replace(/[\p{P}\p{S}]/gu, '').toLowerCase();
-      const isMarked = clean && markedWords.has(clean) && clean.length >= 2;
+      const isMarked = !suppressWordMark && clean && markedWords.has(clean) && clean.length >= 2;
       if (isMarked) {
         nodes.push(React.createElement('mark', {
           key: `m-${plainStart}-${i}`,
