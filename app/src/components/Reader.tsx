@@ -2913,10 +2913,55 @@ function iframeApplyMarks(doc: Document, wordsSet: Set<string>) {
     if (changed) node.parentNode.replaceChild(frag, node);
   }
 }
+/** 取文本节点所在的块级容器（用于判断"块边界"），找不到则返回兜底元素 */
+const HL_BLOCK_TAGS = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|CAPTION|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL|BODY)$/i;
+function blockAncestorOf(node: any, fallback: any): any {
+  let p = node && node.parentElement;
+  while (p) {
+    if (HL_BLOCK_TAGS.test(p.tagName || '')) return p;
+    p = p.parentElement;
+  }
+  return fallback;
+}
+
+/** 兜底：旧版"单节点内精确匹配"（4.4.9 起的行为），保证新逻辑失手时不会比旧版更差 */
+function iframeApplyHighlightLegacy(doc: Document, it: IframeHighlight) {
+  if (!it.text) return;
+  const t = it.text;
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(n: any) {
+      if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes: any[] = []; let nd: any; while (nd = walker.nextNode()) nodes.push(nd);
+  for (const node of nodes) {
+    const text: string = node.nodeValue || '';
+    let from = 0; const frag = doc.createDocumentFragment();
+    let changed = false;
+    while (true) {
+      const idx = text.indexOf(t, from);
+      if (idx < 0) { frag.appendChild(doc.createTextNode(text.slice(from))); break; }
+      if (idx > from) frag.appendChild(doc.createTextNode(text.slice(from, idx)));
+      const span = doc.createElement('span');
+      span.setAttribute('data-highlight-id', it.id);
+      span.setAttribute('data-hl-type', it.type === 'underline' ? 'underline' : 'highlight');
+      span.className = 'user-highlight';
+      span.textContent = text.slice(idx, idx + t.length);
+      frag.appendChild(span);
+      from = idx + t.length;
+      changed = true;
+    }
+    if (changed && node.parentNode) node.parentNode.replaceChild(frag, node);
+  }
+}
+
 function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
   if (!list || !list.length) return;
   const items = list.slice().sort((a, b) => b.text.length - a.text.length);
   for (const it of items) {
+   try {
     if (!it.text) continue;
     // 选区 text 来自 selection.toString()（空白按渲染折叠为单空格），而源码文本节点
     // 保留原始空白（换行/缩进），且多词短语常被 <i>/<b>/<a>/<mark> 等行内元素切成
@@ -2940,34 +2985,59 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
     if (!nodes.length) continue;
 
     // 归一化拼接 + 下标映射（折叠出的空格映射到其右侧首个非空白字符位置，
-    // 使命中区间映射回原始文本时能把中间的空白/换行一并覆盖）
+    // 使命中区间映射回原始文本时能把中间的空白/换行一并覆盖）。
+    // 同时构建「去标点版」，作为精确匹配失手时的兜底（ curly quote / 连字符等差异）。
+    // ⚠️ 关键：跨块级元素边界（</p><p> 紧挨、中间没有空白文本节点时）也要补一个空格——
+    // 浏览器 Selection.toString() 按渲染结果给文本，段落之间会带换行，而源码里没有，
+    // 不补这个空格，"划一整段/几段"的选区永远匹配不上（4.4.12 用户反馈的根因）。
     let normText = '';
+    let normBare = '';
     const locs: Array<{ node: any; offset: number }> = [];
+    const locsBare: Array<{ node: any; offset: number }> = [];
     let pendingSpace = false;
+    let prevBlock: any;
     for (const node of nodes) {
       const v: string = node.nodeValue || '';
+      const blk = blockAncestorOf(node, doc.body);
+      if (prevBlock !== undefined && blk !== prevBlock) pendingSpace = true;
       for (let k = 0; k < v.length; k++) {
         if (/\s/.test(v[k])) { pendingSpace = true; continue; }
-        if (pendingSpace && normText.length > 0) { normText += ' '; locs.push({ node, offset: k }); }
+        if (pendingSpace && normText.length > 0) {
+          normText += ' '; locs.push({ node, offset: k });
+          if (normBare.length > 0) { normBare += ' '; locsBare.push({ node, offset: k }); }
+        }
         pendingSpace = false;
         normText += v[k]; locs.push({ node, offset: k });
+        if (!/[\p{P}\p{S}]/u.test(v[k])) { normBare += v[k]; locsBare.push({ node, offset: k }); }
       }
+      if (v.length > 0) prevBlock = blk;
     }
 
-    // 找全部命中；倒序包裹，避免前面的包裹改变后面命中所映射的节点偏移
-    const hits: Array<[number, number]> = [];
-    let from = 0;
-    while (true) {
-      const idx = normText.indexOf(target, from);
-      if (idx < 0) break;
-      hits.push([idx, idx + target.length]);
-      from = idx + target.length;
+    const findHits = (hay: string, needle: string): Array<[number, number]> => {
+      const out: Array<[number, number]> = [];
+      if (!needle) return out;
+      let f = 0;
+      while (true) {
+        const i = hay.indexOf(needle, f);
+        if (i < 0) break;
+        out.push([i, i + needle.length]);
+        f = i + needle.length;
+      }
+      return out;
+    };
+    const bareTarget = target.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
+    let hits = findHits(normText, target);
+    let useLocs = locs;
+    if (!hits.length && bareTarget) {
+      hits = findHits(normBare, bareTarget);
+      if (hits.length) useLocs = locsBare;
     }
     const nodeIndex = new Map<any, number>();
     nodes.forEach((n, i) => nodeIndex.set(n, i));
+    let applied = 0;
     for (let h = hits.length - 1; h >= 0; h--) {
-      const startLoc = locs[hits[h][0]];
-      const endLoc = locs[hits[h][1] - 1];
+      const startLoc = useLocs[hits[h][0]];
+      const endLoc = useLocs[hits[h][1] - 1];
       if (!startLoc || !endLoc) continue;
       const si = nodeIndex.get(startLoc.node);
       const ei = nodeIndex.get(endLoc.node);
@@ -2989,14 +3059,21 @@ function iframeApplyHighlights(doc: Document, list: IframeHighlight[]) {
         let targetNode = node;
         if (b < len) targetNode.splitText(b);
         if (a > 0) targetNode = targetNode.splitText(a);
+        if (!targetNode.parentNode) continue;
         const span = doc.createElement('span');
         span.setAttribute('data-highlight-id', it.id);
         span.setAttribute('data-hl-type', it.type === 'underline' ? 'underline' : 'highlight');
         span.className = 'user-highlight';
         targetNode.parentNode.replaceChild(span, targetNode);
         span.appendChild(targetNode);
+        applied++;
       }
     }
+    // 新逻辑一处都没包上 → 退回旧版单节点精确匹配，保证表现不比旧版差
+    if (applied === 0) iframeApplyHighlightLegacy(doc, it);
+   } catch {
+     try { iframeApplyHighlightLegacy(doc, it); } catch { /* ignore */ }
+   }
   }
 }
 
@@ -3042,31 +3119,70 @@ function parseHtmlToReact(
   const hlRanges: Array<{ start: number; end: number; id: string; hasNote: boolean; type?: string }> = [];
   const tempDiv = document.createElement('div');
   tempDiv.innerHTML = html;
-  const rawPlain = (tempDiv.textContent || '');
   // 空白归一化匹配：选区 text 来自 selection.toString()（空白按渲染折叠），textContent
   // 保留源码原始空白（换行/缩进）→ 多词高亮直接 indexOf 会失配。构建归一化串并保留
   // 归一化下标 → 原始下标映射，命中后映射回原始偏移（后续渲染按原始偏移切分）。
+  // ⚠️ 与 iframe 版一致：跨块级元素边界要补一个空格（</p><p> 紧挨时源码里没有空白，
+  // 但选区文本按渲染结果带换行），否则"划一整段"永远匹配不上。
   let plainText = '';
+  let plainBare = '';
   const normToRaw: number[] = [];
-  let pendingSpace = false;
-  for (let k = 0; k < rawPlain.length; k++) {
-    if (/\s/.test(rawPlain[k])) { pendingSpace = true; continue; }
-    if (pendingSpace && plainText.length > 0) { plainText += ' '; normToRaw.push(k); }
-    pendingSpace = false;
-    plainText += rawPlain[k]; normToRaw.push(k);
+  const bareToRaw: number[] = [];
+  {
+    const walker = document.createTreeWalker(tempDiv, NodeFilter.SHOW_TEXT, {
+      acceptNode(n: any) {
+        if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode; if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    let rawIdx = 0;
+    let pendingSpace = false;
+    let prevBlock: any;
+    let nd: any;
+    while ((nd = walker.nextNode())) {
+      const v: string = nd.nodeValue || '';
+      const blk = blockAncestorOf(nd, tempDiv);
+      if (prevBlock !== undefined && blk !== prevBlock) pendingSpace = true;
+      for (let k = 0; k < v.length; k++) {
+        if (/\s/.test(v[k])) { pendingSpace = true; continue; }
+        if (pendingSpace && plainText.length > 0) {
+          plainText += ' '; normToRaw.push(rawIdx + k);
+          if (plainBare.length > 0) { plainBare += ' '; bareToRaw.push(rawIdx + k); }
+        }
+        pendingSpace = false;
+        plainText += v[k]; normToRaw.push(rawIdx + k);
+        if (!/[\p{P}\p{S}]/u.test(v[k])) { plainBare += v[k]; bareToRaw.push(rawIdx + k); }
+      }
+      if (v.length > 0) prevBlock = blk;
+      rawIdx += v.length;
+    }
   }
+
+  const matchAll = (hay: string, needle: string, map: number[]): Array<[number, number]> => {
+    const out: Array<[number, number]> = [];
+    if (!needle) return out;
+    let f = 0;
+    while (true) {
+      const i = hay.indexOf(needle, f);
+      if (i < 0) break;
+      out.push([map[i], map[i + needle.length - 1] + 1]);
+      f = i + needle.length;
+    }
+    return out;
+  };
 
   const sortedHl = [...highlights].sort((a, b) => b.text.length - a.text.length);
   for (const hl of sortedHl) {
     if (!hl.text) continue;
     const t = hl.text.replace(/\s+/g, ' ').trim();
     if (!t) continue;
-    let from = 0;
-    while (true) {
-      const i = plainText.indexOf(t, from);
-      if (i < 0) break;
-      const rawStart = normToRaw[i];
-      const rawEnd = normToRaw[i + t.length - 1] + 1;
+    let rawRanges = matchAll(plainText, t, normToRaw);
+    if (rawRanges.length === 0) {
+      const bareT = t.replace(/[\p{P}\p{S}]/gu, '').replace(/\s+/g, ' ').trim();
+      if (bareT) rawRanges = matchAll(plainBare, bareT, bareToRaw);
+    }
+    for (const [rawStart, rawEnd] of rawRanges) {
       const overlapped = hlRanges.some(r =>
         (rawStart >= r.start && rawStart < r.end) || (rawEnd > r.start && rawEnd <= r.end) ||
         (rawStart <= r.start && rawEnd >= r.end)
@@ -3074,7 +3190,6 @@ function parseHtmlToReact(
       if (!overlapped) {
         hlRanges.push({ start: rawStart, end: rawEnd, id: hl.id, hasNote: !!hl.note, type: hl.type });
       }
-      from = i + Math.max(1, t.length);
     }
   }
   hlRanges.sort((a, b) => a.start - b.start);
