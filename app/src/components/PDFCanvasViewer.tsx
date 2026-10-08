@@ -145,12 +145,20 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
   // Render generation counter to prevent stale async results from overwriting state
   const renderGenerationRef = useRef(0);
 
-  // Sync marked words from props into ref
-  // 不在此处调用 drawAllOverlays——下面的"高亮/标记变化" useLayoutEffect 会负责重绘，
-  // 避免在 effect 阶段先重绘一次、再在 layout effect 阶段再重绘一次（双重开销）。
+  // Sync marked words from props into ref, 并立即重绘。
+  // ⚠️ 关键修复：drawAllOverlays 读的是 markedSetRef.current，而它只在 effect 里更新。
+  // 此前 markedSetRef 在被动 useEffect 里更新，而重绘发生在更早的 useLayoutEffect（依赖
+  // wordMarkers），于是立即重绘用的是旧集合 → 新加的生词标记要等翻页/重进出才显示。
+  // 现改为：更新 ref 后立刻在同一处重绘；并把 wordMarkers 从下方重绘 layout effect 的
+  // 依赖里摘掉，避免它用「ref 还是旧的」那一刻抢先画一版把新标记盖掉。
   // 注意：用 normMatch 归一化（去标点/连字符），使 "well-known" 能与 PDF 中断行拆出的词命中。
   useEffect(() => {
     markedSetRef.current = new Set((wordMarkers || []).map(w => normMatch(w.word)));
+    if (wordsRef.current.length > 0 && overlayContainerRef.current) {
+      overlayContainerRef.current.innerHTML = '';
+      drawAllOverlays();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wordMarkers]);
 
   /**
@@ -375,12 +383,14 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageNum, scale]);
 
-  // 高亮/标记数据变化时重绘（不依赖父组件 setState）
+  // 高亮/标记数据变化时重绘（不依赖父组件 setState）。
+  // 仅依赖 highlightVersion：生词标记的重绘已由上面的 wordMarkers effect 负责，
+  // 此处若再带 wordMarkers，会抢在 markedSetRef 更新前用旧集合画一版，把新标记盖掉。
   useLayoutEffect(() => {
     if (wordsRef.current.length === 0) return;
     drawAllOverlays();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [highlightVersion, wordMarkers]);
+  }, [highlightVersion]);
 
   // 覆盖层容器：挂在 canvas 外层 containerRef 上（见 JSX return 中的 <div ref={overlayContainerRef}>），
   // 这样 absolute inset-0 的原点与词坐标（相对 canvas 左上角）严格对齐，高亮不会整体错位。
