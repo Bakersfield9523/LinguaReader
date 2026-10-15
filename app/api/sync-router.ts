@@ -1,8 +1,26 @@
 import { z } from "zod";
 import { createRouter, authedQuery } from "./middleware";
-import { getDb } from "./queries/connection";
+import { getDb, ensureRemoteReady } from "./queries/connection";
 import { userBooks, userWords, userFolders, userSettings, userHighlights, userBookmarks } from "@db/schema";
 import { eq, and } from "drizzle-orm";
+import { TRPCError } from "@trpc/server";
+
+/**
+ * 云端同步端点专用守卫（4.4.16）。
+ * 之前的行为：云端没连上时静默回退本地 SQLite，却返回"同步成功"——
+ * 用户以为数据上了云，其实只写进了本机文件，换设备什么都同步不到。
+ * 现在：明确失败并说明原因（未配置 / 代理未开 / 凭证或网络问题），
+ * 附带 30s 冷却的一次自动重连（启动时代理没开、稍后才打开的情况）。
+ */
+async function requireCloud(): Promise<void> {
+  if (await ensureRemoteReady()) return;
+  throw new TRPCError({
+    code: "PRECONDITION_FAILED",
+    message:
+      "云端未连接，数据无法上传/下载。请检查：① 网络代理（Clash/FlClash）是否开启；" +
+      "② .env 中的 DATABASE_URL 与 TURSO_AUTH_TOKEN 是否配置。当前数据仅保存在本机。",
+  });
+}
 
 export const syncRouter = createRouter({
   // ── 同步书籍 ──
@@ -340,6 +358,7 @@ export const syncRouter = createRouter({
       })
     )
     .mutation(async ({ ctx, input }) => {
+      await requireCloud();
       const db = getDb();
       const userId = ctx.user.id;
 
@@ -552,6 +571,7 @@ export const syncRouter = createRouter({
   // ── 全量下载（获取所有云端数据）──
   fullDownload: authedQuery
     .mutation(async ({ ctx }) => {
+    await requireCloud();
     const db = getDb();
     const userId = ctx.user.id;
 

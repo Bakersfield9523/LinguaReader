@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { env, appRoot } from "../lib/env";
+import { createProxyFetch } from "../lib/proxy-fetch";
 import * as schema from "@db/schema";
 import * as relations from "@db/relations";
 
@@ -118,6 +119,16 @@ function isRemoteDb(url: string): boolean {
   return url.startsWith("libsql:") || url.startsWith("https:") || url.startsWith("http:");
 }
 
+/**
+ * 把 libsql:// 归一化成 https://（4.4.16）。
+ * 原因：@libsql/client 的 expandConfig 会把 libsql:// 映射为 wss（WebSocket）路径，
+ * 而自定义 fetch（本机的代理通道，见 lib/proxy-fetch.ts）在 WebSocket 路径上被忽略，
+ * 只有 https:/http: 的 HTTP 路径才会使用 Config.fetch。不转换的话代理永远不生效。
+ */
+function normalizeRemoteUrl(rawUrl: string): string {
+  return rawUrl.replace(/^libsql:\/\//i, "https://");
+}
+
 function resolveDbPath(rawUrl: string): string {
   // 如果是绝对路径则直接返回（包括 file: 协议的绝对路径）
   const withoutPrefix = rawUrl.replace(/^file:/, "");
@@ -184,35 +195,107 @@ export function getDb() {
  * - 动态加载 @libsql/client，避免本地模式下启动即尝试解析该模块（否则打包后运行目录缺包会崩溃）。
  * - 仅在远程模式（DATABASE_URL 为 libsql:/https:/http:）执行；本地模式直接返回。
  * - 在 boot.ts 的 serve 之前 await，确保云端表结构就绪。
+ *
+ * 4.4.16：URL 归一化为 https:// 并注入可走代理的 fetch（lib/proxy-fetch.ts），
+ * 否则国内网络直连 Turso 必超时——这正是云端同步此前被整体禁用的原因。
  */
 export async function initRemoteDb(): Promise<void> {
   if (!isRemoteDb(env.databaseUrl)) return;
   const { createClient } = await import("@libsql/client");
+  const url = normalizeRemoteUrl(env.databaseUrl);
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* 保留原始值用于日志 */
+  }
+  console.log(`[db] 正在连接云端数据库：${host}`);
   libsqlClient = createClient({
-    url: env.databaseUrl,
+    url,
     authToken: process.env.TURSO_AUTH_TOKEN || undefined,
+    fetch: createProxyFetch(),
   });
   instance = drizzleLibsql(libsqlClient, { schema: fullSchema });
 
-  // 建表（远程为异步 execute；逐条执行 CREATE TABLE IF NOT EXISTS）
-  const statements = CREATE_TABLES_SQL
-    .split(";")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  for (const stmt of statements) {
-    await libsqlClient.execute(stmt);
-  }
-
-  // 为旧版云端库补加新列（CREATE TABLE IF NOT EXISTS 不会改已有表）
-  for (const sql of LOCAL_ALTERS) {
-    try {
-      await libsqlClient.execute(sql);
-    } catch {
-      /* 列已存在则忽略 */
+  try {
+    // 建表（远程为异步 execute；逐条执行 CREATE TABLE IF NOT EXISTS）
+    const statements = CREATE_TABLES_SQL
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    for (const stmt of statements) {
+      await libsqlClient.execute(stmt);
     }
+
+    // 为旧版云端库补加新列（CREATE TABLE IF NOT EXISTS 不会改已有表）
+    for (const sql of LOCAL_ALTERS) {
+      try {
+        await libsqlClient.execute(sql);
+      } catch {
+        /* 列已存在则忽略 */
+      }
+    }
+  } catch (e) {
+    // 关键兜底（4.4.16）：上面已把 instance 指向远程 drizzle，若此时失败不复位，
+    // getDb() 会因 instance 非空而永远返回这个连不上的实例——本地 SQLite 兜底
+    // 整个失效，注册/登录/书架全部报错。这正是"云端没配好 → 连锁崩溃"的形态。
+    instance = null;
+    libsqlClient = null;
+    throw e;
   }
 
   // 全部建表/改表成功后才标记远程就绪，getDb() 据此决定是否走云端分支。
-  // 若上面任一步抛错，异常会冒泡到 boot.ts 的 try/catch，remoteReady 保持 false → 回退本地。
   remoteReady = true;
+  console.log(`[db] 云端数据库就绪：${host}`);
+}
+
+// ── 云端连接的懒重试（4.4.16）──
+// 启动时代理没开/网络不通 → remoteReady=false → 回退本地。用户随后打开代理再点同步时，
+// 由 ensureRemoteReady() 补一次初始化，不必重启应用。失败有 30s 冷却，避免每次同步都干等超时。
+
+let remoteInitInFlight: Promise<void> | null = null;
+let lastRemoteAttemptAt = 0;
+const REMOTE_RETRY_COOLDOWN_MS = 30_000;
+
+/** 是否配置了云端数据库（不论此刻是否连得上） */
+export function isRemoteConfigured(): boolean {
+  return isRemoteDb(env.databaseUrl);
+}
+
+/** 当前是否真正走云端分支 */
+export function isRemoteReady(): boolean {
+  return remoteReady;
+}
+
+/**
+ * 确保云端已连接；未连接且配置了云端时，按冷却时间补一次初始化。
+ * 返回值即 remoteReady：false 表示本次只能用本地 SQLite（调用方应给出明确提示，
+ * 而不是静默写本地库却提示"同步成功"——那是 4.4.16 之前最误导用户的行为）。
+ */
+export async function ensureRemoteReady(): Promise<boolean> {
+  if (remoteReady) return true;
+  if (!isRemoteDb(env.databaseUrl)) return false;
+
+  if (remoteInitInFlight) {
+    try {
+      await remoteInitInFlight;
+    } catch {
+      /* 忽略，下面统一返回 remoteReady */
+    }
+    return remoteReady;
+  }
+
+  const now = Date.now();
+  if (now - lastRemoteAttemptAt < REMOTE_RETRY_COOLDOWN_MS) return false;
+  lastRemoteAttemptAt = now;
+
+  remoteInitInFlight = initRemoteDb().finally(() => {
+    remoteInitInFlight = null;
+  });
+  try {
+    await remoteInitInFlight;
+  } catch (e) {
+    console.error("[db] 云端数据库重连失败，继续使用本地 SQLite：", e);
+  }
+  return remoteReady;
 }
