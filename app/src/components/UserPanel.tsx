@@ -225,7 +225,18 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
       });
       alert('同步成功！');
     } catch (err: any) {
-      alert('同步失败：' + (err.message || '未知错误'));
+      const code = err?.data?.code;
+      if (code === 'UNAUTHORIZED') {
+        // 令牌过期/失效（4.4.17）：说人话，并立即清掉过期登录态——
+        // 否则界面卡在 localStorage 缓存的"假登录"，用户怎么点都是失败。
+        alert('登录已过期，请重新登录后再同步');
+        logout();
+      } else if (!code) {
+        // 网络层错误：后端多半还在启动（Rust 拉起 Node 有几秒延迟）
+        alert('同步失败：后端正在启动或网络不通，请稍等几秒再试');
+      } else {
+        alert('同步失败：' + (err.message || '未知错误'));
+      }
     } finally {
       setSyncing(false);
     }
@@ -324,7 +335,15 @@ export function UserPanel({ onLoginClick }: UserPanelProps) {
 
       alert(`下载成功！\n书籍 ${result.books.length} 本\n单词 ${result.words.length} 个\n高亮 ${result.highlights.length} 条\n书签 ${result.bookmarks.length} 个\n\n注意：书籍文件内容需要重新导入才能阅读。`);
     } catch (err: any) {
-      alert('下载失败：' + (err.message || '未知错误'));
+      const code = err?.data?.code;
+      if (code === 'UNAUTHORIZED') {
+        alert('登录已过期，请重新登录后再下载');
+        logout();
+      } else if (!code) {
+        alert('下载失败：后端正在启动或网络不通，请稍等几秒再试');
+      } else {
+        alert('下载失败：' + (err.message || '未知错误'));
+      }
     } finally {
       setDownloading(false);
     }

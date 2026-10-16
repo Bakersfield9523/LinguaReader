@@ -11,7 +11,10 @@ const JWT_SECRET = new TextEncoder().encode(env.appSecret);
 export async function createToken(payload: { userId: number; email?: string; phone?: string }) {
   return new SignJWT(payload)
     .setProtectedHeader({ alg: "HS256" })
-    .setExpirationTime("30d")
+    // 180d（4.4.17）：原 30d 对"偶尔打开一次的桌面阅读器"太短——用户 8-12 登录、
+    // 9-11 令牌静默过期，之后每次点同步都报"请先登录"而界面仍显示已登录（localStorage
+    // 缓存），排查半天。延长有效期 + 前端 401 自动登出，双管齐下消除该故障模式。
+    .setExpirationTime("180d")
     .setIssuedAt()
     .sign(JWT_SECRET);
 }
