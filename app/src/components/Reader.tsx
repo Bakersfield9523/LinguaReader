@@ -621,7 +621,7 @@ export function Reader({
             return;
           }
           if (parser instanceof EPUBParser && ch.href) {
-            const c = await parser.getChapterContent(ch.href);
+            const c = await parser.getChapterContent(ch.href, ch.anchor);
             if (!isMounted) return;
             setChapterContent(c.html);
             setBookCss(c.css);
@@ -672,10 +672,13 @@ export function Reader({
               // zip 直读失败（href 解析不到）或 TXT 这类无 href 的格式，全靠这条补上，
               // 否则全书字数全空 → 退化为按章数等权 → 进度虚高。
               const fillFromLoadedContent = async (): Promise<boolean> => {
-                let list = book.chapters || [];
+                // 4.4.18：底稿用「本次重新解析出的目录」，而不是旧的 book.chapters
+                //（旧结构 id 不带锚点，withWordCountDeep 永远匹配不上 → 字数写不进去）
+                let list = loadedChapters;
                 let anyChanged = false;
                 for (const c of flatChaptersRef.current) {
-                  const key = c.href || c.id;
+                  // 同 shard 多章 href 相同，必须用带锚点的 id 作键
+                  const key = c.anchor ? c.id : (c.href || c.id);
                   if (!key || c.wordCount != null || wordCountsRef.current.has(key)) continue;
                   const html = contentsRef.current.get(c.id);
                   if (!html || html.includes('（暂无内容）')) continue;
@@ -691,6 +694,32 @@ export function Reader({
               };
 
               if (parser instanceof EPUBParser) {
+                // 4.4.18：EPUB 目录每次开书重新解析得出（现在带 anchor，id 含锚点）。
+                // 把新结构写回，保证持久化的 book.chapters 与实际目录一致（云端同步用的就是它）。
+                // 旧字数按 id 继承，避免每次开书都丢一次已经统计好的字数。
+                const oldCounts = new Map<string, number>();
+                const collectOld = (list: Chapter[]) => {
+                  for (const c of list) {
+                    if (c.wordCount != null) oldCounts.set(c.id, c.wordCount);
+                    if (c.children) collectOld(c.children);
+                  }
+                };
+                collectOld(book.chapters || []);
+                const inheritOld = (list: Chapter[]) => {
+                  for (const c of list) {
+                    // 锚点章节不继承：旧值是整篇 shard 的字数，明显偏大
+                    if (c.wordCount == null && !c.anchor) {
+                      const v = oldCounts.get(c.id);
+                      if (v != null) c.wordCount = v;
+                    }
+                    if (c.children) inheritOld(c.children);
+                  }
+                };
+                inheritOld(loadedChapters);
+                if (JSON.stringify(book.chapters) !== JSON.stringify(loadedChapters)) {
+                  await BookDB.update(book.id, { chapters: loadedChapters });
+                }
+
                 let scanChanged = false;
                 const needsScan = loadedChapters.some((c) => c.wordCount == null);
                 if (needsScan) {
@@ -698,7 +727,7 @@ export function Reader({
                   if (scanChanged && isMounted) {
                     const syncRef = (list: Chapter[]) => {
                       for (const c of list) {
-                        const k = c.href || c.id;
+                        const k = c.anchor ? c.id : (c.href || c.id);
                         if (k && c.wordCount != null) wordCountsRef.current.set(k, c.wordCount);
                         if (c.children) syncRef(c.children);
                       }
@@ -802,7 +831,7 @@ export function Reader({
       setChapterContent(contents.get(chapterId) || '');
     } else if (parser instanceof EPUBParser && chapter.href) {
       // 动态加载 EPUB 章节
-      const content = await parser.getChapterContent(chapter.href);
+      const content = await parser.getChapterContent(chapter.href, chapter.anchor);
       setChapterContent(content.html);
       setBookCss(content.css);
       if (content.css) {
@@ -820,7 +849,8 @@ export function Reader({
     // 首次打开时估算当前章字数并缓存，使进度按真实字数加权（而非按章数）
     // 采用懒计算 + 持久化：不在 getChapters() 里预统计（它每次开书都会跑，会拖慢开书）
     // 键同时支持 href 与 id（TXT 无 href），否则这些章节永远拿不到字数 → 进度退化成按章数
-    const countKey = chapter.href || chapter.id;
+    // 4.4.18：同一 shard 内多章的 href 相同，必须用带锚点的 id 作键，否则多章共用一份字数
+    const countKey = chapter.anchor ? chapter.id : (chapter.href || chapter.id);
     if (countKey && chapter.wordCount == null && !wordCountsRef.current.has(countKey)) {
       const htmlNow = contents.get(chapterId);
       if (htmlNow && !htmlNow.includes('（暂无内容）')) {
@@ -2059,7 +2089,7 @@ export function Reader({
                             if (chId && latestContents.has(chId)) {
                               setChapterContent(latestContents.get(chId) || '');
                             } else if (latestParser instanceof EPUBParser && latestFlatChapters[idx]?.href) {
-                              const content = await latestParser.getChapterContent(latestFlatChapters[idx].href!);
+                              const content = await latestParser.getChapterContent(latestFlatChapters[idx].href!, latestFlatChapters[idx].anchor);
                               setChapterContent(content.html);
                               setBookCss(content.css);
                               if (content.css) {

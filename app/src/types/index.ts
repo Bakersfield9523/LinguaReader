@@ -47,6 +47,13 @@ export interface Chapter {
   title: string;
   index: number;
   href?: string;
+  /**
+   * EPUB 同文件内的小节锚点（如 calibre 的 filepos14732）。
+   * 4.4.18：目录条目常出现「同一份 shard + 不同锚点」（如 split_001.html#filepos14732 与 #filepos66604），
+   * 旧版 resolveHrefToSpine 会把锚点剥掉，导致这些条目 id 相同、内容相同、一起被高亮。
+   * 保留锚点后 id 唯一（href#anchor），内容按锚点切片，每条目录才是真正独立的一章。
+   */
+  anchor?: string;
   wordCount?: number;
   level?: number; // 层级：0=卷/部，1=章，2=节
   type?: 'volume' | 'part' | 'chapter' | 'frontmatter' | 'section';

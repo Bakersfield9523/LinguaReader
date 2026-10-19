@@ -4,6 +4,7 @@ import type { Book, Chapter, PDFTextItem } from '@/types';
 import type { Language } from '@/types';
 import { FONT_STACKS, GENERIC_FAMILY_RE } from '@/lib/fonts';
 import { BookDB } from './db';
+import { splitHrefAnchor, buildChapterId, sliceHtmlByAnchor } from './epubSlice';
 
 // 导入 worker URL（Vite 会自动处理为静态资源路径）
 // @ts-ignore
@@ -314,6 +315,9 @@ export class EPUBParser {
   private spineHrefSet: Set<string> | null = null; // spine 内所有章节 href（相对 OPF 目录）
   private spineKeyMap: Map<string, string> | null = null; // canonicalKey -> spine 规范 href
   private hrefResolveCache: Map<string, string | null> = new Map(); // 目录 href -> spine href
+  // 4.4.18：canonicalKey(文档) -> 该文档内各章锚点，按目录出现顺序。
+  // 供切片时确定「下一章边界」：[本锚点, 下一锚点)。一文件一章的书这里不会有记录。
+  private docAnchorOrder: Map<string, string[]> = new Map();
 
   constructor(arrayBuffer: ArrayBuffer) {
     this.book = ePub(arrayBuffer);
@@ -771,19 +775,40 @@ export class EPUBParser {
       if (navigation && navigation.toc && navigation.toc.length > 0) {
         // 直接按TOC原始顺序和层级结构构建章节树，不过滤任何条目
         let globalIdx = 0;
+        // 4.4.18：id 去重集。键是「文档 + 锚点」——同一份 shard 的不同锚点是**不同章节**，
+        // 绝不能合并（旧版按文档去重会把 Introduction / Chapter I / Chapter II 全吃掉）。
+        const seenIds = new Set<string>();
+        this.docAnchorOrder.clear();
 
         const buildTree = (items: any[], level: number): Chapter[] => {
           const result: Chapter[] = [];
           for (const item of items) {
             if (!item.label) continue;
-            // 目录里的 href 是相对 nav/ncx 文档的，必须解析成 spine href 才能取到正文
+            // 目录里的 href 是相对 nav/ncx 文档的，必须解析成 spine href 才能取到正文。
+            // ⚠️ 只解析「文档部分」：锚点必须原样保留，否则同一 shard 内多章会塌成同一条。
             const rawHref: string = item.href || '';
-            const href = rawHref ? (this.resolveHrefToSpine(rawHref) || rawHref) : '';
+            const { docPart, anchor } = splitHrefAnchor(rawHref);
+            const href = docPart ? (this.resolveHrefToSpine(docPart) || docPart) : '';
+            const id = href ? buildChapterId(href, anchor) : `ch-${globalIdx}`;
+
+            // 真重复（同文档 + 同锚点）才丢弃；不同锚点是不同章节，保留
+            if (seenIds.has(id)) continue;
+            seenIds.add(id);
+
+            // 记录该文档内锚点顺序，供内容切片确定下一章边界
+            if (href && anchor) {
+              const key = this.canonicalKey(href);
+              const list = this.docAnchorOrder.get(key) || [];
+              if (!list.includes(anchor)) list.push(anchor);
+              this.docAnchorOrder.set(key, list);
+            }
+
             const ch: Chapter = {
-              id: href || `ch-${globalIdx}`,
+              id,
               title: item.label.trim() || `Section ${globalIdx + 1}`,
               index: globalIdx++,
               href: href || undefined,
+              anchor: href ? anchor : undefined,
               level,
               type: classifyChapter(item.label),
               isFrontMatter: classifyChapter(item.label) === 'frontmatter',
@@ -970,6 +995,10 @@ export class EPUBParser {
       for (const c of list) {
         if (c.children && c.children.length > 0) await fill(c.children);
         if (c.wordCount != null || !c.href) continue;
+        // 4.4.18：带锚点的章节只是 shard 的一个片段，按整篇 zip 文本统计会偏大，
+        // 且同一 shard 内多章会得到同一个字数（进度加权失真）。
+        // 交给 fillFromLoadedContent / 打开章节时的懒计算，按切片后的真实内容统计。
+        if (c.anchor) continue;
         try {
           const raw = await this.readZipText(c.href);
           if (!raw) continue;
@@ -986,9 +1015,9 @@ export class EPUBParser {
 
   // 获取章节 HTML 内容（直接渲染，保留图片和格式）
   // 返回 { html: 清洗后的章节 HTML, css: 该章节涉及的书籍样式表（含内联与外部 link） }
-  async getChapterContent(href: string): Promise<{ html: string; css: string }> {
+  async getChapterContent(href: string, anchor?: string): Promise<{ html: string; css: string }> {
     try {
-      return await this.loadRawContent(href);
+      return await this.loadRawContent(href, anchor);
     } catch (e) {
       console.error('Error loading chapter:', e);
       return { html: '', css: '' };
@@ -996,7 +1025,7 @@ export class EPUBParser {
   }
 
   // 加载单个 href 的原始 HTML 内容（保留图片和格式）
-  private async loadRawContent(href: string): Promise<{ html: string; css: string }> {
+  private async loadRawContent(href: string, anchor?: string): Promise<{ html: string; css: string }> {
     try {
       // 目录 href 与 spine href 基准可能不同，逐个候选尝试，直到 spine.get 命中
       const resolved = this.resolveHrefToSpine(href);
@@ -1050,7 +1079,18 @@ export class EPUBParser {
         return { html: '', css: '' };
       }
 
-      return this.processHTML(html, baseHref);
+      // 4.4.18：同一份 shard 内有多章时，只取 [本锚点, 下一锚点) 这一段，
+      // 否则每条目录都会渲染整篇 shard（表现为「多条指向同一章」）。
+      let finalHtml = html;
+      if (anchor) {
+        const order = this.docAnchorOrder.get(this.canonicalKey(baseHref)) || [];
+        const i = order.indexOf(anchor);
+        const next = i >= 0 ? order[i + 1] : undefined;
+        // 切片失败（锚点不存在/边界异常）时回退整篇，表现永不差于修复前
+        finalHtml = sliceHtmlByAnchor(html, anchor, next) ?? html;
+      }
+
+      return this.processHTML(finalHtml, baseHref);
     } catch (e) {
       console.warn('Error loading raw content:', href, e);
       return { html: '', css: '' };
@@ -1448,7 +1488,7 @@ export class EPUBParser {
     const loadChapter = async (chapter: Chapter) => {
       if (chapter.href) {
         try {
-          const content = await this.getChapterContent(chapter.href);
+          const content = await this.getChapterContent(chapter.href, chapter.anchor);
           contents.set(chapter.id, content.html);
         } catch (e) {
           console.warn(`Failed to load chapter ${chapter.id}:`, e);
@@ -1948,7 +1988,7 @@ export async function getBookContent(
         if (chapter.href) {
           if (preloaded >= PRELOAD_LIMIT) return;
           try {
-            const content = await parser.getChapterContent(chapter.href);
+            const content = await parser.getChapterContent(chapter.href, chapter.anchor);
             contents.set(chapter.id, content.html);
             // 同步保存书籍 CSS，供初始章节渲染时注入（之前只存 html 导致初始章节完全没书籍样式）
             if (content.css) cssContents.set(chapter.id, content.css);
