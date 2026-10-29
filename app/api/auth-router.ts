@@ -49,22 +49,27 @@ export const authRouter = createRouter({
     .mutation(async ({ input }) => {
       const db = getDb();
 
-      // 检查是否已存在
-      if (input.email) {
+      // 4.4.19：空串归一为 null，否则多条 '' 会撞唯一索引
+      const email = input.email?.trim() || null;
+      const phone = input.phone?.trim() || null;
+
+      // 前置判重：只为给出友好错误，真正的保障是 users 表上的唯一索引
+      // （check-then-insert 有竞态，并发下仍可能同时通过，靠 DB 兜底）
+      if (email) {
         const existing = await db
           .select({ id: users.id })
           .from(users)
-          .where(eq(users.email, input.email))
+          .where(eq(users.email, email))
           .limit(1);
         if (existing.length > 0) {
           throw new TRPCError({ code: "CONFLICT", message: "该邮箱已被注册" });
         }
       }
-      if (input.phone) {
+      if (phone) {
         const existing = await db
           .select({ id: users.id })
           .from(users)
-          .where(eq(users.phone, input.phone))
+          .where(eq(users.phone, phone))
           .limit(1);
         if (existing.length > 0) {
           throw new TRPCError({ code: "CONFLICT", message: "该手机号已被注册" });
@@ -75,25 +80,42 @@ export const authRouter = createRouter({
       const securityAnswerHash = input.securityAnswer
         ? hashPassword(input.securityAnswer)
         : null;
-      const result = await db.insert(users).values({
-        name: input.name,
-        email: input.email || null,
-        phone: input.phone || null,
-        passwordHash,
-        securityQuestion: input.securityQuestion || null,
-        securityAnswer: securityAnswerHash,
-      });
+
+      let result: { lastInsertRowid?: number | bigint };
+      try {
+        result = await db.insert(users).values({
+          name: input.name,
+          email,
+          phone,
+          passwordHash,
+          securityQuestion: input.securityQuestion || null,
+          securityAnswer: securityAnswerHash,
+        });
+      } catch (e: unknown) {
+        // better-sqlite3 同步抛 SqliteError（code = SQLITE_CONSTRAINT_UNIQUE），
+        // 在 async 函数体内变成 rejected promise，try/await/catch 可捕获
+        // （不能改用 .catch() 链——同步抛不进 promise 链）。libsql 侧是 promise reject。
+        const err = e as { code?: string; message?: string };
+        const msg = String(err?.message || "");
+        if (err?.code === "SQLITE_CONSTRAINT_UNIQUE" || /UNIQUE constraint failed/i.test(msg)) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: /email/i.test(msg) ? "该邮箱已被注册" : "该手机号已被注册",
+          });
+        }
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "注册失败，请稍后重试" });
+      }
 
       const userId = Number(result.lastInsertRowid);
       const token = await createToken({
         userId,
-        email: input.email,
-        phone: input.phone,
+        email: email ?? undefined,
+        phone: phone ?? undefined,
       });
 
       return {
         token,
-        user: { id: userId, name: input.name, email: input.email, phone: input.phone },
+        user: { id: userId, name: input.name, email, phone },
       };
     }),
 

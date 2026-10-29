@@ -16,9 +16,15 @@ import { lookupWord, getQuickTranslation } from '@/lib/dictionary';
 import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob, stripHtmlToText, countTextUnits } from '@/lib/fileParser';
 import { resolveFontStack, normalizeFontToken } from '@/lib/fonts';
 import { BookDB, HighlightDB } from '@/lib/db';
+import { putContent } from '@/lib/contentCache';
 import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse } from '@/lib/aiService';
 import { SettingsDialog } from './SettingsDialog';
 import type { Book, WordMarker, DictionaryDefinition, ReaderSettings, Chapter, Bookmark, Highlight } from '@/types';
+
+// 章节正文缓存上限（章数）。单章 HTML 含内联 base64 图片，可达数 MB，
+// 不设上限时读长书会一直膨胀（预加载上限 120 章 × MB 级 ≈ 560MB）。
+// 淘汰是安全的：未命中会重新解析，见 lib/contentCache.ts。
+const CONTENT_CACHE_MAX = 40;
 
 // ============ 阅读进度（按字数加权）============
 // 旧逻辑按「章节序号 / 总章数」算进度，信息页/致谢/很短的章节都被当成一整章，进度失真。
@@ -171,6 +177,8 @@ function MarqueeTitle({
 interface ChapterTreeProps {
   chapters: Chapter[];
   currentChapter: number;
+  /** 全树「章节 id → 扁平索引」映射，递归实例共享同一份 */
+  indexById: Map<string, number>;
   expandedChapters: Set<string>;
   onToggleExpand: (id: string) => void;
   onSelectChapter: (id: string) => void;
@@ -180,29 +188,20 @@ interface ChapterTreeProps {
 function ChapterTree({
   chapters,
   currentChapter,
+  indexById,
   expandedChapters,
   onToggleExpand,
   onSelectChapter,
   level = 0
 }: ChapterTreeProps) {
-  // 计算当前章节在扁平列表中的位置用于高亮判断（递归支持任意层级嵌套）
-  const getFlatIndex = (items: Chapter[], targetId: string): number => {
-    let idx = 0;
-    const search = (list: Chapter[]): boolean => {
-      for (const ch of list) {
-        if (ch.id === targetId) return true;
-        idx++;
-        if (ch.children && search(ch.children)) return true;
-      }
-      return false;
-    };
-    return search(items) ? idx : -1;
-  };
-
   return (
     <div className="space-y-0.5">
       {chapters.map((chapter) => {
-        const flatIdx = getFlatIndex(chapters, chapter.id);
+        // 4.4.19：索引来自「全树 id → 扁平索引」的共享表。
+        // 旧实现在每个实例内对传入数组重新 DFS 计数，而递归实例收到的是兄弟数组，
+        // 于是嵌套子章节算出的是"兄弟内序号" → 高亮错位（且 currentChapter=0 时
+        // 顶层首项与首个子项会同时高亮）。
+        const flatIdx = indexById.get(chapter.id) ?? -1;
         const isActive = flatIdx === currentChapter;
         const hasChildren = chapter.children && chapter.children.length > 0;
         const isExpanded = expandedChapters.has(chapter.id);
@@ -264,6 +263,7 @@ function ChapterTree({
                 <ChapterTree
                   chapters={chapter.children!}
                   currentChapter={currentChapter}
+                  indexById={indexById}
                   expandedChapters={expandedChapters}
                   onToggleExpand={onToggleExpand}
                   onSelectChapter={onSelectChapter}
@@ -484,6 +484,30 @@ export function Reader({
     return result;
   }, [chapters]);
 
+  // 4.4.19：一次构建「id → 扁平索引」表，取代 ChapterTree 里每行独立 DFS。
+  // 旧实现给递归子实例传的是兄弟数组，计数器从 0 重来 → 嵌套子章节高亮错位
+  //（子项算出的是"兄弟内序号"，且 currentChapter=0 时顶层首项与首个子项会同时高亮），
+  // 同时每行重扫一遍是 O(n²)（补章上限 1000 时打开目录明显卡顿）。
+  const chapterIndexById = useMemo(() => {
+    const m = new Map<string, number>();
+    flatChapters.forEach((c, i) => {
+      if (!m.has(c.id)) m.set(c.id, i); // 重复 id 保留首个
+    });
+    return m;
+  }, [flatChapters]);
+
+  // PDF 的 currentChapter 语义是「页码-1」，与扁平目录索引不是一回事，
+  // 直接拿去做目录高亮会全灭或错位 → 取「最后一个起始页 ≤ 当前页」的书签。
+  const tocCurrentIndex = useMemo(() => {
+    if (book.format !== 'pdf') return currentChapter;
+    let idx = -1;
+    flatChapters.forEach((c, i) => {
+      const p = parseInt(c.href || '', 10);
+      if (Number.isFinite(p) && p > 0 && p <= pdfCurrentPage) idx = i;
+    });
+    return idx;
+  }, [book.format, flatChapters, pdfCurrentPage, currentChapter]);
+
   const contentRef = useRef<HTMLDivElement>(null);
   const htmlContentRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null); // EPUB iframe 渲染容器
@@ -493,12 +517,25 @@ export function Reader({
   highlightsRef.current = highlights;
   const iframeCleanHtmlRef = useRef(''); // iframe 内"干净内容"基线（load 后捕获，用于重应用高亮/标记）
   const iframeLoadedRef = useRef(false); // iframe 是否已加载完成（协调 marks 效果与 onLoad）
+  // 4.4.19：记住最近一次注册到 iframe contentWindow 的 scroll handler，
+  // 供下次 srcDoc 重载前摘除（WindowProxy 跨 Document 存活，监听器会叠加）
+  const iframeScrollHandlerRef = useRef<EventListener | null>(null);
 
   // 获取已标记的单词集合（useMemo 避免每次渲染重建 Set）
-  const markedWords = useMemo(
-    () => new Set(wordMarkers.map(w => w.word.toLowerCase())),
+  // 4.4.19：按「集合内容」而非「数组引用」做 memo 的第二层。
+  // wordMarkers 可能因为父级重渲染产生内容完全相同的新数组，而它是下面
+  // iframe 高亮 effect 的依赖 → 新 Set 引用 → doc.body.innerHTML = cleanHtml 整章重建。
+  // 用内容签名作依赖，集合没真正变化时 Set 引用保持稳定。
+  const markedWordsKey = useMemo(
+    () => wordMarkers.map(w => w.word.toLowerCase()).sort().join('\u0001'),
     [wordMarkers]
   );
+  const markedWords = useMemo(
+    () => new Set(markedWordsKey ? markedWordsKey.split('\u0001') : []),
+    [markedWordsKey]
+  );
+  const markedWordsRef = useRef(markedWords);
+  markedWordsRef.current = markedWords;
 
   // 在 DOM 渲染后：高亮已标记单词 + 渲染下划线（带 data-id 和笔记图标）
   // 注：之前使用 `dangerouslySetInnerHTML` + DOM mutation（replaceChild / range.extractContents），
@@ -546,21 +583,11 @@ export function Reader({
     });
   }, []);
 
-  // 找到章节在扁平列表中的索引
-  const findChapterIndex = useCallback((targetId: string): number => {
-    const flatten = (items: Chapter[]): Chapter[] => {
-      const result: Chapter[] = [];
-      for (const ch of items) {
-        result.push(ch);
-        if (ch.children) {
-          result.push(...flatten(ch.children));
-        }
-      }
-      return result;
-    };
-    const flat = flatten(chapters);
-    return flat.findIndex(ch => ch.id === targetId);
-  }, [chapters]);
+  // 找到章节在扁平列表中的索引（4.4.19：直接查表，O(1) 且对嵌套子章节也正确）
+  const findChapterIndex = useCallback(
+    (targetId: string): number => chapterIndexById.get(targetId) ?? -1,
+    [chapterIndexById]
+  );
 
   // 检查是否配置了 API Key
   useEffect(() => {
@@ -573,12 +600,21 @@ export function Reader({
     
     async function loadBook() {
       setLoading(true);
+      // 4.4.19：解析结果必须活到 finally 的后台任务里。
+      // 此前 `const { parser, chapters: loadedChapters, ... }` 声明在 try 块内，是块级作用域，
+      // finally 里访问不到：loadedChapters 直接 ReferenceError（编译期 TS2304 × 8），
+      // 而 `parser` 会退化成同名的 useState 变量——首次开书时它还是 null，
+      // 于是「后台补字数 / EPUB 结构回写 / PDF 逐页文本量统计」整段永远是死代码。
+      let loadedParser: EPUBParser | PDFParser | null = null;
+      let loadedChapterList: Chapter[] = [];
       try {
         // 打开书时立即更新 lastReadAt，确保书架排序正确
         onUpdateProgress(book.id, book.progress || 0, book.currentChapter);
 
-        const { parser, chapters: loadedChapters, contents: loadedContents, cssContents: loadedCss, fontCss: loadedFontCss } = await getBookContent(book);
-        
+        const { parser: newParser, chapters: loadedChapters, contents: loadedContents, cssContents: loadedCss, fontCss: loadedFontCss } = await getBookContent(book);
+        loadedParser = newParser;
+        loadedChapterList = loadedChapters;
+
         if (!isMounted) return;
         
         // 扁平化章节列表 - 使用 loadedChapters 直接计算，不依赖 chapters state
@@ -594,17 +630,19 @@ export function Reader({
           return result;
         })();
         
-        setParser(parser);
+        setParser(newParser);
         setChapters(loadedChapters);
         setContents(loadedContents);
         setCssContents(loadedCss);
         setBookFontCss(loadedFontCss || '');
 
         // 使用 book.currentChapter prop（最新值），而不是 stale 的 state
-        const initialChapter = Math.min(
-          book.currentChapter || 0,
-          Math.max(0, flat.length - 1)
-        );
+        // 4.4.19：PDF 的 currentChapter 语义是「页码-1」，与目录条数无关；
+        // 旧代码把它钳到 flat.length-1，会把第 50 页钳成目录最后一条（幸而
+        // finally 里会用 book.currentChapter 覆盖回来，但语义仍是错的）。
+        const initialChapter = book.format === 'pdf'
+          ? (book.currentChapter || 0)
+          : Math.min(book.currentChapter || 0, Math.max(0, flat.length - 1));
         setCurrentChapter(initialChapter);
 
         // 加载当前章节内容
@@ -620,8 +658,8 @@ export function Reader({
             setBookCss(loadedCss.get(ch.id) || '');
             return;
           }
-          if (parser instanceof EPUBParser && ch.href) {
-            const c = await parser.getChapterContent(ch.href, ch.anchor);
+          if (newParser instanceof EPUBParser && ch.href) {
+            const c = await newParser.getChapterContent(ch.href, ch.anchor);
             if (!isMounted) return;
             setChapterContent(c.html);
             setBookCss(c.css);
@@ -630,12 +668,15 @@ export function Reader({
           }
         };
 
-        if (initialChapter < flat.length && flat[initialChapter]) {
-          await ensureChapterContent(initialChapter);
-        } else if (flat.length > 0) {
-          // 如果当前章节不存在，加载第一章
-          await ensureChapterContent(0);
-          setCurrentChapter(0);
+        // PDF 没有 contents / 也不是 EPUBParser，ensureChapterContent 永远不会命中，跳过
+        if (book.format !== 'pdf') {
+          if (initialChapter < flat.length && flat[initialChapter]) {
+            await ensureChapterContent(initialChapter);
+          } else if (flat.length > 0) {
+            // 如果当前章节不存在，加载第一章
+            await ensureChapterContent(0);
+            setCurrentChapter(0);
+          }
         }
       } catch (error) {
         console.error('Error loading book:', error);
@@ -674,7 +715,7 @@ export function Reader({
               const fillFromLoadedContent = async (): Promise<boolean> => {
                 // 4.4.18：底稿用「本次重新解析出的目录」，而不是旧的 book.chapters
                 //（旧结构 id 不带锚点，withWordCountDeep 永远匹配不上 → 字数写不进去）
-                let list = loadedChapters;
+                let list = loadedChapterList;
                 let anyChanged = false;
                 for (const c of flatChaptersRef.current) {
                   // 同 shard 多章 href 相同，必须用带锚点的 id 作键
@@ -693,7 +734,7 @@ export function Reader({
                 return anyChanged;
               };
 
-              if (parser instanceof EPUBParser) {
+              if (loadedParser instanceof EPUBParser) {
                 // 4.4.18：EPUB 目录每次开书重新解析得出（现在带 anchor，id 含锚点）。
                 // 把新结构写回，保证持久化的 book.chapters 与实际目录一致（云端同步用的就是它）。
                 // 旧字数按 id 继承，避免每次开书都丢一次已经统计好的字数。
@@ -715,15 +756,15 @@ export function Reader({
                     if (c.children) inheritOld(c.children);
                   }
                 };
-                inheritOld(loadedChapters);
-                if (JSON.stringify(book.chapters) !== JSON.stringify(loadedChapters)) {
-                  await BookDB.update(book.id, { chapters: loadedChapters });
+                inheritOld(loadedChapterList);
+                if (JSON.stringify(book.chapters) !== JSON.stringify(loadedChapterList)) {
+                  await BookDB.update(book.id, { chapters: loadedChapterList });
                 }
 
                 let scanChanged = false;
-                const needsScan = loadedChapters.some((c) => c.wordCount == null);
+                const needsScan = loadedChapterList.some((c) => c.wordCount == null);
                 if (needsScan) {
-                  scanChanged = await parser.estimateAllWordCounts(loadedChapters, book.language);
+                  scanChanged = await loadedParser.estimateAllWordCounts(loadedChapterList, book.language);
                   if (scanChanged && isMounted) {
                     const syncRef = (list: Chapter[]) => {
                       for (const c of list) {
@@ -732,18 +773,24 @@ export function Reader({
                         if (c.children) syncRef(c.children);
                       }
                     };
-                    syncRef(loadedChapters);
-                    await BookDB.update(book.id, { chapters: loadedChapters });
+                    syncRef(loadedChapterList);
+                    await BookDB.update(book.id, { chapters: loadedChapterList });
                   }
                 }
                 // zip 直读可能整本失败（href 解析不到）→ 再用已加载内容兜底一次
                 const filled = await fillFromLoadedContent();
                 if (!isMounted) return;
                 if (scanChanged || filled) recompute();
-              } else if (parser instanceof PDFParser) {
+              } else if (loadedParser instanceof PDFParser) {
+                // 4.4.19：PDF 目录每次开书重新解析得出（修正旧库里错误/碰撞的页码与 id），
+                // 与库里的做 diff 后回写。必须放在 pageWordCounts 早退之前，
+                // 否则已有逐页统计的书永远写不回目录。
+                if (JSON.stringify(book.chapters) !== JSON.stringify(loadedChapterList)) {
+                  await BookDB.update(book.id, { chapters: loadedChapterList });
+                }
                 pageCountsRef.current = book.pageWordCounts || [];
                 if (pageCountsRef.current.length) return; // 已有统计，直接跳过
-                const counts = await parser.getPageTextCounts(book.language);
+                const counts = await loadedParser.getPageTextCounts(book.language);
                 if (!isMounted || !counts.length) return;
                 pageCountsRef.current = counts;
                 await BookDB.update(book.id, { pageWordCounts: counts });
@@ -819,14 +866,27 @@ export function Reader({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book.id]);
 
+  // 4.4.19：handlePdfPageChange 定义在下方（依赖 pdfTotalPages / pageCountsRef），
+  // 而 changeChapter / jumpToBookmark 的依赖数组在声明时就要求值 → 直接引用会 TS2448。
+  // 用 ref 转发，调用发生在用户点击时，那时早已赋值。
+  const handlePdfPageChangeRef = useRef<((page: number) => void) | null>(null);
+
   // 切换章节（使用 flatChapters 扁平列表）
   const changeChapter = useCallback(async (index: number) => {
+    // 4.4.19：PDF 的 currentChapter 语义是「页码-1」，不是扁平目录索引。
+    // 走这里会被下面的 `index >= flatChapters.length` 守卫直接吞掉（书签点了没反应），
+    // 且后面会用「按章数加权」的进度覆盖掉 PDF 正确的「按页文本量加权」进度。
+    if (book.format === 'pdf') {
+      handlePdfPageChangeRef.current?.(index + 1);
+      return;
+    }
     if (index < 0 || index >= flatChapters.length) return;
 
     setCurrentChapter(index);
     const chapter = flatChapters[index];
     const chapterId = chapter.id;
 
+    const contents = contentsRef.current;
     if (contents.has(chapterId)) {
       setChapterContent(contents.get(chapterId) || '');
     } else if (parser instanceof EPUBParser && chapter.href) {
@@ -839,8 +899,12 @@ export function Reader({
       } else {
         console.log('[Reader] no book css for chapter', chapter.href);
       }
-      contents.set(chapterId, content.html);
-      setContents(new Map(contents));
+      // 4.4.19：走 LRU 写入，上限 CONTENT_CACHE_MAX，淘汰时先抢救字数
+      setContents((prev) => putContent(prev, chapterId, content.html, {
+        max: CONTENT_CACHE_MAX,
+        keepId: chapterId,
+        onEvict: evictWordCountSaver,
+      }));
     } else {
       // 没有预加载内容时的 fallback（PDF 或其他格式）
       setChapterContent(contents.get(chapterId) || `第 ${index + 1} 章\n\n（暂无内容）`);
@@ -893,7 +957,8 @@ export function Reader({
     contentRef.current?.scrollTo(0, 0);
     // iframe 模式下新章节 srcDoc 重新加载，自动回到顶部
     if (epubRenderMode === 'iframe') scrollPosRef.current = 0;
-  }, [flatChapters, contents, parser, book.id, onUpdateProgress, loadBookmarks, loadHighlights, epubRenderMode]);
+    // 4.4.19：contents 改为在函数内读 contentsRef（避免 LRU 淘汰导致本回调反复重建）
+  }, [flatChapters, parser, book.id, book.format, onUpdateProgress, loadBookmarks, loadHighlights, epubRenderMode]);
 
   // ============ EPUB iframe 渲染：父窗口直接操作 iframe.contentDocument ============
   // 不依赖 postMessage / 内联脚本（Tauri CSP 会拦截内联脚本）。所有交互由父窗口
@@ -969,7 +1034,13 @@ export function Reader({
     if (book.format === 'epub' && epubRenderMode === 'iframe') return;
     if (scrollRestoredRef.current) return;
     if (!contentRef.current || !chapterContent) return;
-    const pos = book.scrollPosition || scrollPosRef.current;
+    // 4.4.19：改用挂载时快照 pendingRestorePosRef（与 iframe 路径一致）。
+    // 旧代码优先读 book.scrollPosition，而它会被滚动保存持续回灌成"当前章百分比"：
+    // ① 切章时这个回调会因依赖变化换新身份 → 新章被滚到上一章的百分比；
+    // ② 不切章时也会按取整后的百分比反复回设 scrollTop，造成抖动。
+    const pos = pendingRestorePosRef.current || scrollPosRef.current;
+    // 用掉即清零：切章时 scrollRestoredRef 会被重置，若不清零下一章又会按同一百分比恢复
+    pendingRestorePosRef.current = 0;
     if (pos > 0) {
       scrollRestoredRef.current = true;
       const el = contentRef.current;
@@ -980,7 +1051,7 @@ export function Reader({
         setTimeout(() => { scrollRestoredRef.current = false; }, 600);
       });
     }
-  }, [book.scrollPosition, chapterContent, book.format]);
+  }, [chapterContent, book.format, epubRenderMode]);
 
   // 章节内容加载完成后恢复滚动位置
   useEffect(() => {
@@ -1003,11 +1074,30 @@ export function Reader({
   const pageCountsRef = useRef<number[]>(book.pageWordCounts || []);
   const contentsRef = useRef(contents);
   contentsRef.current = contents;
+
+  // 4.4.19：正文缓存上限。单章含内联 base64 图片可达数 MB，无上限时读长书会持续膨胀。
+  // 淘汰不会丢内容——切章 / 开书 / 跳章三条路径都会在未命中时重新解析。
+  // 淘汰前先把字数抢救进 wordCountsRef，否则 fillFromLoadedContent 扫不到被清掉的章节
+  // → 字数缺失 → 进度退化成按章等权（正是 4.4.18 才修好的"进度虚高"）。
+  const evictWordCountSaver = (victimId: string, html: string) => {
+    const ch = flatChaptersRef.current.find((c) => c.id === victimId);
+    if (!ch) return;
+    const key = ch.anchor ? ch.id : (ch.href || ch.id);
+    if (!key || ch.wordCount != null || wordCountsRef.current.has(key)) return;
+    if (!html || html.includes('（暂无内容）')) return;
+    const n = countTextUnits(stripHtmlToText(html), book.language);
+    if (n > 0) wordCountsRef.current.set(key, n);
+  };
+
   const parserRef = useRef(parser);
   parserRef.current = parser;
   // 当前章节的 EPUB 内路径（相对 OPF 目录），供脚注跨文件解析用，避免闭包过期
   const currentChapterHrefRef = useRef('');
-  currentChapterHrefRef.current = (flatChapters[currentChapter] && flatChapters[currentChapter].href) || '';
+  // 4.4.19：PDF 的 chapter.href 是页码字符串（如 "42"），不是 EPUB 内路径，
+  // 拿去解析脚注相对路径会得到垃圾结果 → PDF 下置空。
+  currentChapterHrefRef.current = book.format === 'pdf'
+    ? ''
+    : ((flatChapters[currentChapter] && flatChapters[currentChapter].href) || '');
 
   // 获取单词周围的上下文
   // 辅助函数：从 HTML 提取纯文本
@@ -1092,19 +1182,25 @@ export function Reader({
   }, [chapterContent, htmlToPlainText]);
 
   // 添加书签
+  // 4.4.19：PDF 的 currentChapter 是「页码-1」，远大于目录条数 →
+  // 旧代码 `flatChapters[currentChapter]` 恒为 undefined → 静默 return，书签根本加不上。
   const addBookmark = useCallback(async () => {
-    const chapter = flatChapters[currentChapter];
-    if (!chapter) return;
+    const isPdf = book.format === 'pdf';
+    const idx = isPdf ? pdfCurrentPage - 1 : currentChapter;
+    const title = isPdf
+      ? `第 ${pdfCurrentPage} 页`
+      : (flatChapters[idx]?.title || `第 ${idx + 1} 章`);
     const bm: Bookmark = {
-      id: `${book.id}-${currentChapter}-${Date.now()}`,
+      id: `${book.id}-${idx}-${Date.now()}`,
       bookId: book.id,
-      chapterIndex: currentChapter,
-      chapterTitle: chapter.title,
+      // PDF 语义固定为「页码-1」，与高亮口径一致（见 addHighlight）
+      chapterIndex: idx,
+      chapterTitle: title,
       createdAt: Date.now(),
     };
     await BookDB.addBookmark(bm);
     setBookmarks(prev => [bm, ...prev]);
-  }, [book.id, currentChapter, flatChapters]);
+  }, [book.id, book.format, currentChapter, flatChapters, pdfCurrentPage]);
 
   // 删除书签
   const deleteBookmark = useCallback(async (id: string) => {
@@ -1113,10 +1209,13 @@ export function Reader({
   }, []);
 
   // 跳转到书签
+  // 4.4.19：PDF 书签的 chapterIndex 是「页码-1」，必须翻页而不是切章
+  //（changeChapter 的 `index >= flatChapters.length` 守卫会把它吞掉 → 点了没反应）
   const jumpToBookmark = useCallback((bm: Bookmark) => {
-    changeChapter(bm.chapterIndex);
+    if (book.format === 'pdf') handlePdfPageChangeRef.current?.(bm.chapterIndex + 1);
+    else changeChapter(bm.chapterIndex);
     setShowBookmarks(false);
-  }, [changeChapter]);
+  }, [book.format, changeChapter]);
 
   // 添加高亮/下划线
   const addHighlight = useCallback(async (text: string, type: 'underline' | 'highlight' = 'highlight'): Promise<Highlight | null> => {
@@ -1486,29 +1585,45 @@ export function Reader({
 
   // PDF 翻页时同步更新 currentChapter 和保存阅读进度
   const handlePdfPageChange = useCallback((page: number) => {
-    setPdfCurrentPage(page);
+    // 4.4.19：入口钳制到 1..总页数。pdfTotalPages 可能是 0（onPageCount 尚未回调），
+    // 此时不能钳到 0，否则会把页码打回 1。
+    const max = pdfTotalPages > 0 ? pdfTotalPages : Number.MAX_SAFE_INTEGER;
+    const p = Math.min(Math.max(1, Math.round(page) || 1), max);
+
+    setPdfCurrentPage(p);
     // PDF 的 currentChapter 存的是页码-1
-    const chapterIdx = page - 1;
+    const chapterIdx = p - 1;
     setCurrentChapter(chapterIdx);
     // 按每页文本量加权（图表/空白页权重低，密集正文页权重高）；无文字层(扫描版)回退等权按页
     const counts = pageCountsRef.current;
     const total = counts.length ? counts.reduce((a, b) => a + b, 0) : 0;
     let progress: number;
     if (total > 0 && counts.length >= pdfTotalPages) {
-      const before = counts.slice(0, page - 1).reduce((a, b) => a + b, 0);
-      progress = Math.max(1, Math.min(100, Math.round(((before + (counts[page - 1] || 0)) / total) * 100)));
+      const before = counts.slice(0, p - 1).reduce((a, b) => a + b, 0);
+      progress = Math.max(1, Math.min(100, Math.round(((before + (counts[p - 1] || 0)) / total) * 100)));
     } else {
-      progress = pdfTotalPages > 0 ? Math.max(1, Math.round((page / pdfTotalPages) * 100)) : 0;
+      progress = pdfTotalPages > 0 ? Math.max(1, Math.round((p / pdfTotalPages) * 100)) : 0;
     }
     bookProgressRef.current = progress;
     onUpdateProgress(book.id, progress, chapterIdx);
   }, [book.id, pdfTotalPages, onUpdateProgress]);
+  handlePdfPageChangeRef.current = handlePdfPageChange;
 
   // 当前章节高亮（直接派生，避免在 renderContent 内部 filter 产生闭包陷阱）
   const currentChapterHighlights = useMemo(
     () => highlights.filter(h => h.chapterIndex === currentChapter),
     [highlights, currentChapter]
   );
+  // 4.4.19：同上，按内容签名稳定化。highlights 数组引用变化（但内容没变）时
+  // 不应触发整章 DOM 重建——那是滚动时闪烁与选区销毁的根因。
+  const highlightsKey = useMemo(
+    () => currentChapterHighlights
+      .map(h => `${h.id}\u0002${h.text}\u0002${h.note || ''}\u0002${h.type || ''}`)
+      .join('\u0003'),
+    [currentChapterHighlights]
+  );
+  const currentChapterHighlightsRef = useRef(currentChapterHighlights);
+  currentChapterHighlightsRef.current = currentChapterHighlights;
 
   // 标记/高亮变化：重建内容并重新应用（保留滚动位置）。
   useEffect(() => {
@@ -1516,9 +1631,9 @@ export function Reader({
     const doc = f && f.contentDocument;
     if (!doc || !doc.body || !iframeLoadedRef.current) return;
     const prevY = doc.scrollingElement ? (doc.scrollingElement as HTMLElement).scrollTop : 0;
-    iframeApplyAll(doc, iframeCleanHtmlRef.current, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, fontFamily: fontStack, fontOverride }, markedWords, currentChapterHighlights.map(h => ({ id: h.id, text: h.text, note: h.note, type: h.type })));
+    iframeApplyAll(doc, iframeCleanHtmlRef.current, { fontSize: settings.fontSize, lineHeight: settings.lineHeight, theme: settings.theme, fontFamily: fontStack, fontOverride }, markedWordsRef.current, currentChapterHighlightsRef.current.map(h => ({ id: h.id, text: h.text, note: h.note, type: h.type })));
     try { if (doc.scrollingElement) (doc.scrollingElement as HTMLElement).scrollTop = prevY; } catch (err) { /* ignore */ }
-  }, [markedWords, currentChapterHighlights]);
+  }, [markedWordsKey, highlightsKey]);
 
   // ===== EPUB iframe 交互（父窗口直接操作 iframe.contentDocument，绕开 CSP 内联限制）=====
   // 用 ref 持有最新的 handleWordClick，避免 iframe 内绑定事件后闭包过期读到旧的 book.language / hasAiKey。
@@ -1647,8 +1762,17 @@ export function Reader({
     doc.body.addEventListener('mouseup', onIframeMouseup as EventListener);
     // 绑定滚动监听：iframe 内部滚动不会冒泡到父级 <main>（其 overflow-hidden），
     // 必须直接监听 iframe 自身的 window，否则滚动位置永远无法捕获/保存。
+    // 4.4.19：必须先摘掉上一次注册的 handler。srcDoc 变化会重建 Document（所以
+    // doc.body 上的 click/mouseup 不会累积），但 contentWindow 是复用的 WindowProxy，
+    // 而 handleScroll 每次渲染都是新引用 → addEventListener 不去重 → 切 20 章叠 20 个
+    // 监听器，滚动一次触发 20 次进度保存。
     if (f.contentWindow) {
+      const prev = iframeScrollHandlerRef.current;
+      if (prev) {
+        try { f.contentWindow.removeEventListener('scroll', prev); } catch { /* ignore */ }
+      }
       f.contentWindow.addEventListener('scroll', handleScroll, { passive: true });
+      iframeScrollHandlerRef.current = handleScroll as EventListener;
     }
     // 恢复上次阅读位置：iframe 内部滚动需直接操作 iframe 文档的 scrollingElement。
     // 使用 pendingRestorePosRef（挂载时捕获的 DB 值），避免被后续进度保存覆盖。
@@ -1809,21 +1933,23 @@ export function Reader({
                   ) : (
                     <ChapterTree
                       chapters={chapters}
-                      currentChapter={currentChapter}
+                      // PDF 下 currentChapter 是「页码-1」，必须用 tocCurrentIndex 才能让目录高亮跟页走
+                      currentChapter={tocCurrentIndex}
+                      indexById={chapterIndexById}
                       expandedChapters={expandedChapters}
                       onToggleExpand={toggleExpand}
                       onSelectChapter={(chapterId) => {
                         if (book.format === 'pdf') {
-                          // PDF: extract page number from chapter href or id
-                          const ch = chapters.find(c => c.id === chapterId);
-                          const pageNum = ch?.href ? parseInt(ch.href, 10) : undefined;
-                          if (pageNum && pageNum >= 1) {
-                            handlePdfPageChange(pageNum);
-                          } else {
-                            // Fallback: use chapter index as page number
-                            const idx = chapters.findIndex(c => c.id === chapterId);
-                            if (idx >= 0) handlePdfPageChange(idx + 1);
-                          }
+                          // 4.4.19：改用扁平查找。旧代码用 chapters.find 只查顶层，
+                          // 嵌套子书签点了没反应；且没有页码越界钳制。
+                          const idx = chapterIndexById.get(chapterId) ?? -1;
+                          if (idx < 0) return;
+                          const ch = flatChapters[idx];
+                          const pageFromHref = ch?.href ? parseInt(ch.href, 10) : NaN;
+                          const page = Number.isFinite(pageFromHref) && pageFromHref >= 1
+                            ? pageFromHref
+                            : idx + 1;
+                          handlePdfPageChange(page); // 钳制在 handlePdfPageChange 内做
                         } else {
                           const idx = findChapterIndex(chapterId);
                           if (idx >= 0) changeChapter(idx);
@@ -1850,10 +1976,15 @@ export function Reader({
 
             <div className="hidden md:block">
               <h1 className="font-semibold truncate max-w-[300px]">
-                {flatChapters[currentChapter]?.title || book.title}
+                {book.format === 'pdf'
+                  ? (flatChapters[tocCurrentIndex]?.title || `第 ${pdfCurrentPage} 页`)
+                  : (flatChapters[currentChapter]?.title || book.title)}
               </h1>
               <p className="text-xs opacity-60">
-                {currentChapter + 1} / {flatChapters.length} 章
+                {/* 4.4.19：PDF 显示页码。旧代码统一显示「N / M 章」，PDF 下是错的 */}
+                {book.format === 'pdf'
+                  ? `${pdfCurrentPage} / ${pdfTotalPages || flatChapters.length} 页`
+                  : `${currentChapter + 1} / ${flatChapters.length} 章`}
               </p>
             </div>
           </div>
@@ -2097,8 +2228,12 @@ export function Reader({
                               } else {
                                 console.log('[Reader] no book css for chapter', latestFlatChapters[idx].href);
                               }
-                              latestContents.set(chId!, content.html);
-                              setContents(new Map(latestContents));
+                              // 4.4.19：同样走 LRU（此处此前是 mutate + 全量拷贝，无上限）
+                              setContents((prev) => putContent(prev, chId!, content.html, {
+                                max: CONTENT_CACHE_MAX,
+                                keepId: chId!,
+                                onEvict: evictWordCountSaver,
+                              }));
                             }
                             // 按字数加权（排除卷首/附录），与切章/滚动保存保持一致
                             const progress = computeReadingProgress(

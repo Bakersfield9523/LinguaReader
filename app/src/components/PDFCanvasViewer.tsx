@@ -688,7 +688,10 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       ro.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [drawAllOverlays]);
+    // 4.4.19：必须依赖 loading。首次渲染 loading=true，下面的 `if (loading) return`
+    // 会早退到 spinner，主渲染 JSX（及其 ref）根本没挂载 → 这个 effect 拿不到 target
+    // 而直接 return；加载完 setLoading(false) 后若依赖不变，effect 不会重跑 → 永久失效。
+  }, [drawAllOverlays, loading]);
 
   // ===== 关键：拦截 onMouseUp 全局冒泡，避免 React 在 onUp 后重渲染时意外重置覆盖层 =====
   // 当用户在 PDF 内 mousedown 后，浏览器原生 selection 仍可能存在；
@@ -951,7 +954,8 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     // Capture phase to intercept before bubbling
     el.addEventListener('wheel', handler, { passive: false, capture: true });
     return () => el.removeEventListener('wheel', handler, { capture: true });
-  }, [scale]);
+    // 4.4.19：同上，加 loading。pageNum/totalPages/onPageChange 已用 ref 规避，不必入依赖。
+  }, [scale, loading]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -971,7 +975,8 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     if (!container) return;
     container.addEventListener('mousedown', handleLinkClick, true);
     return () => container.removeEventListener('mousedown', handleLinkClick, true);
-  }, [handleLinkClick]);
+    // 4.4.19：同上，加 loading。
+  }, [handleLinkClick, loading]);
 
   if (loading) {
     return (

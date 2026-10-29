@@ -1,10 +1,16 @@
 import type { DictionaryDefinition, Language } from '@/types';
 import { lemmatize } from './lemmatize';
+import { getBackendPort } from './backend';
 
-// Merriam-Webster Learner's Dictionary API（英文在线词典）
-const MW_BASE_URL = 'https://www.dictionaryapi.com/api/v3/references/learners/json';
-// Key 从环境变量读取（见 .env.example），避免明文写入源码 / git 历史
-const MW_API_KEY = import.meta.env.VITE_MW_API_KEY ?? '';
+// Merriam-Webster Learner's Dictionary（英文在线词典）
+// 4.4.19：Key 已移到后端（见 api/mw-proxy.ts）。此前写在 import.meta.env.VITE_MW_API_KEY，
+// Vite 会对 VITE_ 前缀做构建期内联，明文 Key 被打进 dist 产物随安装包分发。
+// ⚠️ 绝不可再引入 VITE_MW_API_KEY：即使写在 import.meta.env.DEV 的死分支里也会被内联。
+// 开发态由 vite dev-server 同源转发到 api/boot.ts，生产态走本机后端端口（与 aiService 同款拼法）。
+const isDev = import.meta.env.DEV;
+function mwBase(): string {
+  return isDev ? '' : `http://localhost:${getBackendPort()}`;
+}
 
 // 回退源：Wiktionary（维基词典）API —— 免费、无需 Key、覆盖极全。
 // 为何选它而非 Free Dictionary：后者 (api.dictionaryapi.dev) 在本机 Cloudflare + 代理下 TLS 握手失败（curl exit 35），
@@ -265,7 +271,7 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
   const cacheKey = word.toLowerCase();
   let result: DictionaryDefinition | null = null;
   try {
-    const url = `${MW_BASE_URL}/${encodeURIComponent(cacheKey)}?key=${MW_API_KEY}`;
+    const url = `${mwBase()}/api/mw/${encodeURIComponent(cacheKey)}`;
     const data = await fetchJson(url, MW_TIMEOUT_MS);
     if (!Array.isArray(data) || data.length === 0) return null;
 

@@ -6,6 +6,7 @@ import { appRouter } from "./router";
 import { createContext } from "./context";
 import { env } from "./lib/env";
 import aiProxy from "./ai-proxy";
+import mwProxy from "./mw-proxy";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
@@ -13,8 +14,11 @@ const app = new Hono<{ Bindings: HttpBindings }>();
 // 开发模式 @hono/vite-dev-server 自动处理 CORS，重复添加会导致 Vite dev server 崩溃
 if (env.isProduction) {
   const { cors } = await import("hono/cors");
+  const { isAllowedOrigin } = await import("./lib/cors-origin");
   app.use("*", cors({
-    origin: (origin) => origin || "*",
+    // 4.4.19：白名单制。非白名单来源返回 null → 不写 Access-Control-Allow-Origin
+    // → 浏览器判定跨域失败。此前是 `origin || "*"`（回显任意 Origin），等于对全网开放。
+    origin: (origin) => (isAllowedOrigin(origin) ? origin : null),
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
   }));
@@ -29,6 +33,8 @@ app.use("/api/trpc/*", async (c) => {
   });
 });
 app.route("/api/ai", aiProxy);
+// 4.4.19：MW 词典代理，Key 只存在后端，避免随前端产物分发
+app.route("/api/mw", mwProxy);
 app.all("/api/*", (c) => c.json({ error: "Not Found" }, 404));
 
 export default app;
@@ -56,7 +62,9 @@ if (env.isProduction) {
   }
 
   const port = parseInt(process.env.PORT || "3000");
-  serve({ fetch: app.fetch, port }, () => {
-    console.log(`Server running on http://localhost:${port}/`);
+  // 4.4.19：只监听回环地址。此前未传 hostname → Node 绑到 ::（所有网卡），
+  // 公共 WiFi 下同网段机器可直接访问本机 API（含无鉴权的 /api/ai）。
+  serve({ fetch: app.fetch, port, hostname: "127.0.0.1" }, () => {
+    console.log(`Server running on http://127.0.0.1:${port}/`);
   });
 }

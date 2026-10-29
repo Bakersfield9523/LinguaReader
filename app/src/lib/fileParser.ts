@@ -5,6 +5,7 @@ import type { Language } from '@/types';
 import { FONT_STACKS, GENERIC_FAMILY_RE } from '@/lib/fonts';
 import { BookDB } from './db';
 import { splitHrefAnchor, buildChapterId, sliceHtmlByAnchor } from './epubSlice';
+import { buildOutlineChapters, type OutlineEntry } from './pdfOutline';
 
 // 导入 worker URL（Vite 会自动处理为静态资源路径）
 // @ts-ignore
@@ -1644,70 +1645,63 @@ export class PDFParser {
     return counts;
   }
 
+  /**
+   * 4.4.19：dest → 页码。带缓存——1000 条书签就是 1000 次 getPageIndex，
+   * pdfjs 每次都要遍历页树，不缓存会退化成 O(N²)。
+   *
+   * ⚠️ 绝不可读 `dest[0].num`：那是 **PDF 对象号**，与页码没有任何换算关系，
+   * 这是「点目录跳错页 / 点子目录跳到顶层」的根因。
+   * 正确写法见 PDFCanvasViewer.tsx 的 handleLinkClick：
+   * getDestination（命名目标）→ getPageIndex（对象引用 → 0 基页索引）→ +1。
+   */
+  private destPageCache = new Map<string, number>();
+
+  private async resolveDestPage(dest: unknown): Promise<number | null> {
+    if (!this.pdf || !dest) return null;
+    const d0 = Array.isArray(dest) ? (dest[0] as { num?: number; gen?: number } | undefined) : undefined;
+    const cacheKey = typeof dest === 'string'
+      ? `n:${dest}`
+      : `o:${d0?.num ?? ''}:${d0?.gen ?? ''}`;
+    const hit = this.destPageCache.get(cacheKey);
+    if (hit != null) return hit;
+
+    try {
+      let arr: unknown = dest;
+      if (typeof dest === 'string') {
+        // 命名目标：先解析成显式 dest 数组
+        arr = await this.pdf.getDestination(dest);
+      }
+      if (!Array.isArray(arr) || !arr[0]) return null;
+      const pageIndex = await this.pdf.getPageIndex(arr[0] as never);
+      if (typeof pageIndex !== 'number' || !Number.isFinite(pageIndex)) return null;
+      const page = pageIndex + 1;
+      this.destPageCache.set(cacheKey, page);
+      return page;
+    } catch {
+      return null;
+    }
+  }
+
   async generateChaptersFromOutline(): Promise<Chapter[]> {
     if (!this.pdf) return [];
-    
+
     // Try to get PDF outline (bookmarks) first
-    let outline: any[] = [];
+    let outline: OutlineEntry[] = [];
     try {
-      outline = await this.pdf.getOutline() || [];
+      outline = (await this.pdf.getOutline()) || [];
     } catch (e) {
       console.log('[PDF] No outline found');
     }
-    
-    if (outline.length > 0) {
-      // Use PDF bookmarks as chapters
-      const chapters: Chapter[] = [];
-      const processOutlineItem = (item: any, idx: number): Chapter => {
-        const dest = item.dest;
-        let pageNum = idx + 1;
-        
-        // Try to resolve destination to page number
-        if (dest) {
-          if (typeof dest === 'string') {
-            // Named destination - will be resolved later
-          } else if (Array.isArray(dest) && dest[0] && typeof dest[0] === 'object') {
-            pageNum = (dest[0] as any).num || idx + 1;
-          }
-        }
-        
-        const chapter: Chapter = {
-          id: `pdf-ch-${idx}`,
-          title: item.title || `第 ${pageNum} 页`,
-          index: idx,
-          href: String(pageNum),
-        };
-        
-        if (item.items && item.items.length > 0) {
-          chapter.children = item.items.map((child: any, ci: number) => 
-            processOutlineItem(child, idx * 100 + ci)
-          );
-        }
-        
-        return chapter;
-      };
-      
-      for (let i = 0; i < outline.length; i++) {
-        chapters.push(processOutlineItem(outline[i], i));
-      }
-      
-      return chapters;
-    }
-    
-    // Fallback: one chapter per page
-    const numPages = this.pdf.numPages;
-    const chapters: Chapter[] = [];
-    
-    for (let i = 0; i < numPages; i++) {
-      chapters.push({
-        id: `page-${i + 1}`,
-        title: `第 ${i + 1} 页`,
-        index: i,
-        href: String(i + 1),
-      });
-    }
-    
-    return chapters;
+
+    // 4.4.19：树→章节的纯逻辑抽到 pdfOutline.ts（可单测，且修复了 id 碰撞）
+    const chapters = await buildOutlineChapters(
+      outline,
+      (item) => this.resolveDestPage(item?.dest),
+      this.pdf.numPages,
+    );
+    if (chapters.length > 0) return chapters;
+
+    return this.generateChapters(); // 无 outline：每页一章
   }
 
   generateChapters(): Chapter[] {
@@ -2025,17 +2019,17 @@ export async function getBookContent(
         return { parser: null, chapters: book.chapters || [], contents, cssContents, fontCss: '' };
       }
       
-      // Use existing chapters or regenerate from outline
+      // 4.4.19：**每次开书都重新解析** PDF 目录，不再复用库里的旧数据。
+      // 原因：旧目录是用「PDF 对象号」当页码写进去的（几乎必然错），且 id 有碰撞，
+      // 只靠「为空才重建」永远修不好存量书。getOutline() 很轻，重解析是自愈的最低成本。
+      // 上层（Reader）会把新目录与库里的做 diff 后回写。
       let chapters: Chapter[];
-      if (book.chapters && book.chapters.length > 0) {
-        chapters = book.chapters;
-      } else {
-        try {
-          chapters = await parser.generateChaptersFromOutline();
-        } catch (e) {
-          chapters = parser.generateChapters();
-        }
+      try {
+        chapters = await parser.generateChaptersFromOutline();
+      } catch (e) {
+        chapters = parser.generateChapters();
       }
+      if (chapters.length === 0) chapters = book.chapters || [];
       
       // PDF content is rendered on-demand by PDFCanvasViewer — no need to preload
       return { parser, chapters, contents, cssContents, fontCss: '' };

@@ -8,8 +8,11 @@ import {
 // ── Users ──
 export const users = sqliteTable("users", {
   id: integer("id", { mode: "number" }).primaryKey({ autoIncrement: true }),
-  email: text("email"),
-  phone: text("phone"),
+  // 4.4.19：唯一约束，防止抢注他人邮箱/手机号后让受害者永久登不上。
+  // 注意：运行时真正生效的是 api/queries/connection.ts 的 LOCAL_ALTERS 索引迁移
+  // （项目无迁移文件、不跑 drizzle migrate，此处仅表达 schema 意图）。
+  email: text("email").unique(),
+  phone: text("phone").unique(),
   name: text("name").notNull().default(""),
   avatar: text("avatar"), // base64 encoded avatar image
   passwordHash: text("password_hash").notNull(),

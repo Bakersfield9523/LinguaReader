@@ -142,20 +142,45 @@ function ensureTables(sqlite: InstanceType<typeof Database>) {
   sqlite.exec(CREATE_TABLES_SQL);
 }
 
-// 本地 SQLite 表结构迁移：为已存在的旧表补加新列（CREATE TABLE IF NOT EXISTS 不会改已有表）
-// 每条 ALTER 独立 try/catch，列已存在时忽略报错。
+// 本地 SQLite 表结构迁移：为已存在的旧表补加新列/新索引（CREATE TABLE IF NOT EXISTS 不会改已有表）
+// 每条语句独立 try/catch，列/索引已存在时忽略报错。
+// 4.4.19：新增邮箱/手机号唯一约束。此前 users.email / users.phone 无任何唯一性保障，
+// 加上注册是「先 SELECT 判重再 INSERT」且不在事务内 → 可被抢注他人邮箱，导致受害者
+// 登录时 .limit(1) 命中攻击者记录而永久登不上。
+// 刻意不改 CREATE_TABLES_SQL：CREATE TABLE IF NOT EXISTS 对已存在的库直接跳过，
+// 加了 UNIQUE 老库也不生效，会造成「新库有约束 / 老库没有」的行为分裂。
 const LOCAL_ALTERS = [
   "ALTER TABLE users ADD COLUMN security_question TEXT",
   "ALTER TABLE users ADD COLUMN security_answer TEXT",
+  // 空串归一为 NULL：否则多条 '' 会互相冲突导致索引建不上
+  // （SQLite 的 UNIQUE 索引把多个 NULL 视为互不相等，只填手机号的用户不受影响）
+  "UPDATE users SET email = NULL WHERE email IS NOT NULL AND TRIM(email) = ''",
+  "UPDATE users SET phone = NULL WHERE phone IS NOT NULL AND TRIM(phone) = ''",
+  "CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)",
 ];
 
 function migrateLocalSchema(sqlite: InstanceType<typeof Database>) {
   for (const sql of LOCAL_ALTERS) {
     try {
       sqlite.exec(sql);
-    } catch {
-      /* 列已存在则忽略 */
+    } catch (e) {
+      // 老库若已存在重复邮箱/手机号，唯一索引会建不上：只告警不改数据
+      // （把重复行清空会让人直接登不上，破坏性大于收益）
+      console.warn("[db] migration skipped:", sql, "→", (e as Error)?.message);
     }
+  }
+  try {
+    const dup = sqlite
+      .prepare(
+        "SELECT email AS k, COUNT(*) AS c FROM users WHERE email IS NOT NULL GROUP BY email HAVING c > 1",
+      )
+      .all() as Array<{ k: string; c: number }>;
+    if (dup.length) {
+      console.warn("[db] 存量库存在重复邮箱，唯一索引未生效，请人工清理：", dup);
+    }
+  } catch {
+    /* 体检失败不影响启动 */
   }
 }
 
@@ -227,12 +252,12 @@ export async function initRemoteDb(): Promise<void> {
       await libsqlClient.execute(stmt);
     }
 
-    // 为旧版云端库补加新列（CREATE TABLE IF NOT EXISTS 不会改已有表）
+    // 为旧版云端库补加新列/新索引（CREATE TABLE IF NOT EXISTS 不会改已有表）
     for (const sql of LOCAL_ALTERS) {
       try {
         await libsqlClient.execute(sql);
-      } catch {
-        /* 列已存在则忽略 */
+      } catch (e) {
+        console.warn("[db] remote migration skipped:", sql, "→", (e as Error)?.message);
       }
     }
   } catch (e) {

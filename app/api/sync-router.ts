@@ -362,8 +362,14 @@ export const syncRouter = createRouter({
       const db = getDb();
       const userId = ctx.user.id;
 
+      // 4.4.19：localId 是去重键，空串会让所有空 id 的记录塌成同一条（互相覆盖）。
+      // 源头过滤掉，避免写入 local_id='' 的垃圾行。
+      const books = input.books.filter((b) => b.localId);
+      const words = input.words.filter((w) => w.localId);
+      const folders = input.folders.filter((f) => f.localId);
+
       // 同步书籍
-      for (const book of input.books) {
+      for (const book of books) {
         const existing = await db
           .select({ id: userBooks.id })
           .from(userBooks)
@@ -383,13 +389,13 @@ export const syncRouter = createRouter({
             contentsMap: book.contentsMap || null,
             folderId: book.folderId || null,
             lastReadAt: book.lastReadAt ? new Date(book.lastReadAt) : null,
-            localId: book.localId || book.id,
+            localId: book.localId,
             updatedAt: new Date(),
           }).where(eq(userBooks.id, existing[0].id));
         } else {
           await db.insert(userBooks).values({
             userId,
-            localId: book.localId || book.id,
+            localId: book.localId,
             title: book.title,
             author: book.author || null,
             language: book.language,
@@ -406,11 +412,11 @@ export const syncRouter = createRouter({
       }
 
       // 同步单词
-      for (const w of input.words) {
+      for (const w of words) {
         const existing = await db
           .select({ id: userWords.id })
           .from(userWords)
-          .where(and(eq(userWords.userId, userId), eq(userWords.localId, w.localId || w.id)))
+          .where(and(eq(userWords.userId, userId), eq(userWords.localId, w.localId)))
           .limit(1);
 
         if (existing.length > 0) {
@@ -424,12 +430,12 @@ export const syncRouter = createRouter({
             aiContext: w.aiContext || null,
             dictionary: w.dictionary || null,
             masteryLevel: w.masteryLevel,
-            localId: w.localId || w.id,
+            localId: w.localId,
           }).where(eq(userWords.id, existing[0].id));
         } else {
           await db.insert(userWords).values({
             userId,
-            localId: w.localId || w.id,
+            localId: w.localId,
             bookId: w.bookId,
             chapterId: w.chapterId || null,
             word: w.word,
@@ -445,24 +451,24 @@ export const syncRouter = createRouter({
       }
 
       // 同步文件夹
-      for (const f of input.folders) {
+      for (const f of folders) {
         const existing = await db
           .select({ id: userFolders.id })
           .from(userFolders)
-          .where(and(eq(userFolders.userId, userId), eq(userFolders.localId, f.localId || f.id)))
+          .where(and(eq(userFolders.userId, userId), eq(userFolders.localId, f.localId)))
           .limit(1);
 
         if (existing.length > 0) {
           await db.update(userFolders).set({
             name: f.name,
             color: f.color || null,
-            localId: f.localId || f.id,
+            localId: f.localId,
             updatedAt: new Date(),
           }).where(eq(userFolders.id, existing[0].id));
         } else {
           await db.insert(userFolders).values({
             userId,
-            localId: f.localId || f.id,
+            localId: f.localId,
             name: f.name,
             color: f.color || null,
           });

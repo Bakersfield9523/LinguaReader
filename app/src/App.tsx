@@ -44,10 +44,12 @@ function MainApp() {
   useEffect(() => {
     if (currentBook && currentView === 'reader') {
       const updated = books.find(b => b.id === currentBook.id);
+      // 4.4.19：去掉 scrollPosition 的比较项。滚动保存每 500ms 就会改它一次，
+      // 于是每半秒产出一个新的 currentBook 引用 → 下游 useMemo 全失效。
+      // （进度/章节这类真正影响 UI 的字段仍保留比较。）
       if (updated && (
         updated.progress !== currentBook.progress ||
-        updated.currentChapter !== currentBook.currentChapter ||
-        updated.scrollPosition !== currentBook.scrollPosition
+        updated.currentChapter !== currentBook.currentChapter
       )) {
         setCurrentBook(updated);
       }
@@ -59,9 +61,16 @@ function MainApp() {
   // of PDFCanvasViewer (which is wrapped in memo). Without this, every App-level
   // re-render creates a new array reference from the inline .filter(), breaking
   // memo equality checks and causing the wordMarkers effect to fire redundantly.
+  // 4.4.19：只依赖 currentBook?.id，不依赖 currentBook 对象本身。
+  // 否则滚动保存（每 500ms 更新一次 book）会不断产出新数组引用 →
+  // Reader 里 markedWords（新 Set）→ iframe 高亮 effect → doc.body.innerHTML = cleanHtml
+  // 整章 DOM 全量重建：连续滚动每半秒闪一次、划词选区被销毁。
+  // words 仍在依赖里，加/删/改生词照旧传播（这是本 memo 唯一的真实输入）。
+  const currentBookId = currentBook?.id ?? null;
   const currentBookWords = useMemo(
-    () => currentBook ? words.filter(w => w.bookId === currentBook.id) : [],
-    [words, currentBook]
+    () => (currentBookId ? words.filter(w => w.bookId === currentBookId) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [words, currentBookId]
   );
 
   const handleOpenBook = useCallback((book: Book) => {
