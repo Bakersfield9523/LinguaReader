@@ -3,6 +3,7 @@ import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { HighlightDB } from '@/lib/db';
 import { fileDataToArrayBuffer } from '@/lib/fileParser';
+import { createDestPageResolver, createPdfDestAdapter } from '@/lib/pdfDest';
 import { ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { WordMarker } from '@/types';
 
@@ -120,6 +121,8 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
 }: PDFCanvasViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
+  /** 4.4.20：dest → 页码解析器（含缓存），文档加载完成后绑定 */
+  const destResolverRef = useRef<((dest: unknown) => Promise<number | null>) | null>(null);
   const wordsRef = useRef<WordBox[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
   const outerRef = useRef<HTMLDivElement>(null);
@@ -247,6 +250,8 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         }
         if (cancelled) { pdf.destroy(); return; }
         pdfRef.current = pdf;
+        // 4.4.20：链接跳转与目录共用同一套 dest 解析（含 dest[0] 为纯数字的分支）
+        destResolverRef.current = createDestPageResolver(createPdfDestAdapter(pdf));
         setTotalPages(pdf.numPages);
         try { onPageCount?.(pdf.numPages); } catch (e) { /* ignore */ }
         setLoading(false);
@@ -261,6 +266,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         pdfRef.current.destroy();
         pdfRef.current = null;
       }
+      destResolverRef.current = null;
     };
   }, [fileData, onPageCount]);
 
@@ -876,22 +882,15 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       return;
     }
 
-    if (link.dest && pdfRef.current) {
-      try {
-        let destArray: any[] | null = null;
-        if (typeof link.dest === 'string') {
-          destArray = await pdfRef.current.getDestination(link.dest);
-        } else if (Array.isArray(link.dest)) {
-          destArray = link.dest;
-        }
-        if (destArray && destArray[0]) {
-          const pageIndex = await pdfRef.current.getPageIndex(destArray[0]);
-          if (typeof pageIndex === 'number') {
-            onPageChangeRef.current?.(pageIndex + 1);
-          }
-        }
-      } catch (err) {
-        console.error('PDF 链接跳转失败:', err);
+    if (link.dest && pdfRef.current && destResolverRef.current) {
+      // 4.4.20：统一走 pdfDest.resolveDestToPage。
+      // 旧代码直接 `getPageIndex(destArray[0])`，dest[0] 是纯数字时 pdfjs 会抛错，
+      // 被 catch 静默吞掉 → 页内链接（目录页、脚注、交叉引用）点了没反应。
+      const page = await destResolverRef.current(link.dest);
+      if (page != null) {
+        onPageChangeRef.current?.(page);
+      } else {
+        console.warn('[PDF] 链接目标无法解析，已忽略:', link.dest);
       }
     }
   }, []);

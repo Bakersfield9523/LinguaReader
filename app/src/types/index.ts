@@ -60,6 +60,28 @@ export interface Chapter {
   children?: Chapter[]; // 子章节（用于多级导航）
   parentId?: string; // 父章节ID
   isFrontMatter?: boolean; // 是否为卷首内容（前言/版权等）
+
+  // ===== 以下三个字段仅 PDF 使用（4.4.20）=====
+
+  /**
+   * 解析出的 1 基页码。
+   * - `number`：可跳转
+   * - `null`：dest 解析失败（坏书签 / 命名目标缺失 / dest 是非法结构）。
+   *   此时**保留条目但点击不跳转**，只提示「无法定位」。
+   * - `undefined`：EPUB/TXT，或 4.4.19 及更早的旧数据，不参与 PDF 逻辑。
+   *
+   * 4.4.20 之前失败条目会沿用「上一个成功页码」，导致一批条目塌陷到同一页——
+   * 这正是「点不同目录项跳到同一页」的根因，因此这里必须能表达 null。
+   */
+  page?: number | null;
+  /**
+   * pdfjs `getOutline()` 给出的原始 dest（`string` 命名目标，或
+   * `[RefProxy|number, ...]` 显式目标数组）。存下来用于点击时懒解析，
+   * 避免开书时把错误页码固化进 IndexedDB。
+   */
+  dest?: unknown;
+  /** 目录嵌套深度（顶层 0）。高亮「同一页有多个条目」时取深度最深者，保证每页只亮一个。 */
+  depth?: number;
 }
 
 // AI对话消息

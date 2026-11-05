@@ -284,6 +284,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               <p>• 所有提供商均使用 OpenAI 兼容接口格式</p>
               <p>• 新用户注册各平台通常可获得免费额度</p>
             </div>
+
+            {/* 版本号：用于确认当前跑的是哪个构建 */}
+            <p className="text-[11px] text-white/25 pt-2">LinguaReader v{__APP_VERSION__}</p>
           </div>
         )}
       </DialogContent>

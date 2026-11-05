@@ -6,6 +6,7 @@ import { FONT_STACKS, GENERIC_FAMILY_RE } from '@/lib/fonts';
 import { BookDB } from './db';
 import { splitHrefAnchor, buildChapterId, sliceHtmlByAnchor } from './epubSlice';
 import { buildOutlineChapters, type OutlineEntry } from './pdfOutline';
+import { createDestPageResolver, createPdfDestAdapter } from './pdfDest';
 
 // 导入 worker URL（Vite 会自动处理为静态资源路径）
 // @ts-ignore
@@ -1646,40 +1647,21 @@ export class PDFParser {
   }
 
   /**
-   * 4.4.19：dest → 页码。带缓存——1000 条书签就是 1000 次 getPageIndex，
-   * pdfjs 每次都要遍历页树，不缓存会退化成 O(N²)。
+   * 4.4.20：dest → 页码的解析器下沉到 pdfDest.ts（可单测的三态逻辑 + 缓存）。
    *
-   * ⚠️ 绝不可读 `dest[0].num`：那是 **PDF 对象号**，与页码没有任何换算关系，
-   * 这是「点目录跳错页 / 点子目录跳到顶层」的根因。
-   * 正确写法见 PDFCanvasViewer.tsx 的 handleLinkClick：
-   * getDestination（命名目标）→ getPageIndex（对象引用 → 0 基页索引）→ +1。
+   * 缓存是必须的：1000 条书签就是 1000 次 getPageIndex，pdfjs 每次都要遍历页树，
+   * 不缓存会退化成 O(N²)。解析器缓存在实例上，生命周期与 PDFParser 一致——
+   * Reader 整个会话都持有 parserRef，所以目录点击的懒解析也能复用同一份缓存。
    */
-  private destPageCache = new Map<string, number>();
+  private destResolver: ((dest: unknown) => Promise<number | null>) | null = null;
 
-  private async resolveDestPage(dest: unknown): Promise<number | null> {
-    if (!this.pdf || !dest) return null;
-    const d0 = Array.isArray(dest) ? (dest[0] as { num?: number; gen?: number } | undefined) : undefined;
-    const cacheKey = typeof dest === 'string'
-      ? `n:${dest}`
-      : `o:${d0?.num ?? ''}:${d0?.gen ?? ''}`;
-    const hit = this.destPageCache.get(cacheKey);
-    if (hit != null) return hit;
-
-    try {
-      let arr: unknown = dest;
-      if (typeof dest === 'string') {
-        // 命名目标：先解析成显式 dest 数组
-        arr = await this.pdf.getDestination(dest);
-      }
-      if (!Array.isArray(arr) || !arr[0]) return null;
-      const pageIndex = await this.pdf.getPageIndex(arr[0] as never);
-      if (typeof pageIndex !== 'number' || !Number.isFinite(pageIndex)) return null;
-      const page = pageIndex + 1;
-      this.destPageCache.set(cacheKey, page);
-      return page;
-    } catch {
-      return null;
+  /** 供目录点击时懒解析 dest 使用（page 为 null 的老条目） */
+  getDestPageResolver(): ((dest: unknown) => Promise<number | null>) | null {
+    if (!this.pdf) return null;
+    if (!this.destResolver) {
+      this.destResolver = createDestPageResolver(createPdfDestAdapter(this.pdf));
     }
+    return this.destResolver;
   }
 
   async generateChaptersFromOutline(): Promise<Chapter[]> {
@@ -1694,9 +1676,11 @@ export class PDFParser {
     }
 
     // 4.4.19：树→章节的纯逻辑抽到 pdfOutline.ts（可单测，且修复了 id 碰撞）
+    // 4.4.20：dest 解析改走 pdfDest.ts，dest[0] 为纯数字时不再抛错
+    const resolver = this.getDestPageResolver();
     const chapters = await buildOutlineChapters(
       outline,
-      (item) => this.resolveDestPage(item?.dest),
+      (item) => (resolver ? resolver(item?.dest) : Promise.resolve(null)),
       this.pdf.numPages,
     );
     if (chapters.length > 0) return chapters;

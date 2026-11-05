@@ -19,6 +19,13 @@ import { BookDB, HighlightDB } from '@/lib/db';
 import { putContent } from '@/lib/contentCache';
 import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse } from '@/lib/aiService';
 import { SettingsDialog } from './SettingsDialog';
+import { Toaster } from '@/components/ui/sonner';
+import { toast } from 'sonner';
+import {
+  buildPageRepTable,
+  findActiveTocChapterId,
+  shouldWriteBackPdfChapters,
+} from '@/lib/pdfOutline';
 import type { Book, WordMarker, DictionaryDefinition, ReaderSettings, Chapter, Bookmark, Highlight } from '@/types';
 
 // 章节正文缓存上限（章数）。单章 HTML 含内联 base64 图片，可达数 MB，
@@ -179,6 +186,14 @@ interface ChapterTreeProps {
   currentChapter: number;
   /** 全树「章节 id → 扁平索引」映射，递归实例共享同一份 */
   indexById: Map<string, number>;
+  /**
+   * 4.4.20：PDF 专用高亮目标（章节 id）。
+   * - `undefined` = EPUB/TXT → 走下面 currentChapter 扁平索引比较
+   * - `null`      = PDF 但当前页之前没有任何有效条目 → 一个都不高亮
+   * - `string`    = PDF 命中的代表条目
+   * 用 undefined/null 区分，是为了避免 PDF 无声退回索引比较（那样 -1 会误亮）。
+   */
+  activeChapterId?: string | null;
   expandedChapters: Set<string>;
   onToggleExpand: (id: string) => void;
   onSelectChapter: (id: string) => void;
@@ -189,6 +204,7 @@ function ChapterTree({
   chapters,
   currentChapter,
   indexById,
+  activeChapterId,
   expandedChapters,
   onToggleExpand,
   onSelectChapter,
@@ -201,8 +217,12 @@ function ChapterTree({
         // 旧实现在每个实例内对传入数组重新 DFS 计数，而递归实例收到的是兄弟数组，
         // 于是嵌套子章节算出的是"兄弟内序号" → 高亮错位（且 currentChapter=0 时
         // 顶层首项与首个子项会同时高亮）。
+        // 4.4.20：PDF 改按 id 精确匹配（activeChapterId），彻底消除"多个条目同亮"。
         const flatIdx = indexById.get(chapter.id) ?? -1;
-        const isActive = flatIdx === currentChapter;
+        const isActive =
+          activeChapterId !== undefined
+            ? chapter.id === activeChapterId
+            : flatIdx === currentChapter;
         const hasChildren = chapter.children && chapter.children.length > 0;
         const isExpanded = expandedChapters.has(chapter.id);
         const isFront = chapter.isFrontMatter || chapter.type === 'frontmatter';
@@ -255,6 +275,15 @@ function ChapterTree({
                   </span>
                 </MarqueeTitle>
               </button>
+
+              {/* PDF：右侧显示该条目指向的页码。
+                  「—」表示 dest 解析失败（点击会提示无法定位）。
+                  有了它，目录是否正常一眼可判，不用再靠点进去试。 */}
+              {chapter.page !== undefined && (
+                <span className="flex-shrink-0 pr-2 text-[10px] tabular-nums opacity-40 select-none">
+                  {chapter.page ?? '—'}
+                </span>
+              )}
             </div>
 
             {/* 递归渲染子章节 */}
@@ -264,6 +293,7 @@ function ChapterTree({
                   chapters={chapter.children!}
                   currentChapter={currentChapter}
                   indexById={indexById}
+                  activeChapterId={activeChapterId}
                   expandedChapters={expandedChapters}
                   onToggleExpand={onToggleExpand}
                   onSelectChapter={onSelectChapter}
@@ -497,16 +527,22 @@ export function Reader({
   }, [flatChapters]);
 
   // PDF 的 currentChapter 语义是「页码-1」，与扁平目录索引不是一回事，
-  // 直接拿去做目录高亮会全灭或错位 → 取「最后一个起始页 ≤ 当前页」的书签。
-  const tocCurrentIndex = useMemo(() => {
+  // 直接拿去做目录高亮会全灭或错位。
+  //
+  // 4.4.20：改用「页码 → 代表条目」表 + 倒序查最近起始页（对齐 pdf.js 官方
+  // _getPageNumberToDestHash 与 sioyek）。旧实现在扁平数组上取「DFS 序最后一个
+  // page ≤ 当前页」的条目，outline 页序异常时会高亮到错误条目，且没有
+  //「同一页多个条目只选一个代表」的约束 → 可能多条同亮。
+  const tocActiveChapterId = useMemo<string | null | undefined>(() => {
+    if (book.format !== 'pdf') return undefined;
+    return findActiveTocChapterId(buildPageRepTable(chapters), pdfCurrentPage);
+  }, [book.format, chapters, pdfCurrentPage]);
+
+  // PDF 下目录高亮目标的扁平索引（顶部标题栏用；EPUB/TXT 继续用 currentChapter）
+  const tocActiveIndex = useMemo(() => {
     if (book.format !== 'pdf') return currentChapter;
-    let idx = -1;
-    flatChapters.forEach((c, i) => {
-      const p = parseInt(c.href || '', 10);
-      if (Number.isFinite(p) && p > 0 && p <= pdfCurrentPage) idx = i;
-    });
-    return idx;
-  }, [book.format, flatChapters, pdfCurrentPage, currentChapter]);
+    return tocActiveChapterId != null ? (chapterIndexById.get(tocActiveChapterId) ?? -1) : -1;
+  }, [book.format, currentChapter, tocActiveChapterId, chapterIndexById]);
 
   const contentRef = useRef<HTMLDivElement>(null);
   const htmlContentRef = useRef<HTMLDivElement>(null);
@@ -785,7 +821,16 @@ export function Reader({
                 // 4.4.19：PDF 目录每次开书重新解析得出（修正旧库里错误/碰撞的页码与 id），
                 // 与库里的做 diff 后回写。必须放在 pageWordCounts 早退之前，
                 // 否则已有逐页统计的书永远写不回目录。
-                if (JSON.stringify(book.chapters) !== JSON.stringify(loadedChapterList)) {
+                //
+                // 4.4.20：加质量门槛。解析整体抽风（一本 outline 几乎全是坏 dest）时
+                // 结果是「page 全 null」，不能拿它覆盖库里尚存的旧目录；
+                // 但也绝不能用「新旧成功数比较」——4.4.19 及更早的旧数据因为错误地
+                // 继承了上一页，成功数恒为 100%，那样比较会让 bug 永远修不好。
+                const qualityOk = shouldWriteBackPdfChapters(loadedChapterList);
+                if (
+                  qualityOk &&
+                  JSON.stringify(book.chapters) !== JSON.stringify(loadedChapterList)
+                ) {
                   await BookDB.update(book.id, { chapters: loadedChapterList });
                 }
                 pageCountsRef.current = book.pageWordCounts || [];
@@ -1609,6 +1654,43 @@ export function Reader({
   }, [book.id, pdfTotalPages, onUpdateProgress]);
   handlePdfPageChangeRef.current = handlePdfPageChange;
 
+  /**
+   * PDF 目录点击（4.4.20）。
+   *
+   * 旧实现拿 `parseInt(ch.href)`，无效时兜底 `idx + 1`——把「扁平目录序号」当页码，
+   * 于是不同条目落到同一页 / 跳错页。现在：
+   *   1. `page` 有值 → 直接跳（开书时已解析好，最常见）
+   *   2. `page` 为 null → 用该条目的原始 dest 懒解析一次
+   *   3. 仍然失败 → 提示「无法定位」，**不跳转**（绝不猜页码）
+   */
+  const handlePdfTocClick = useCallback(async (chapterId: string) => {
+    const idx = chapterIndexById.get(chapterId) ?? -1;
+    if (idx < 0) return;
+    const ch = flatChapters[idx];
+    if (!ch) return;
+
+    if (typeof ch.page === 'number' && ch.page >= 1) {
+      handlePdfPageChangeRef.current?.(ch.page);
+      return;
+    }
+
+    const p = parserRef.current;
+    if (p instanceof PDFParser && ch.dest != null) {
+      const resolver = p.getDestPageResolver();
+      if (resolver) {
+        const page = await resolver(ch.dest);
+        if (page != null) {
+          handlePdfPageChangeRef.current?.(page);
+          return;
+        }
+      }
+    }
+
+    toast.error(`无法定位「${ch.title || '该目录项'}」`, {
+      description: '这个书签在 PDF 里没有有效目标，可以用底部页码栏手动翻页。',
+    });
+  }, [chapterIndexById, flatChapters]);
+
   // 当前章节高亮（直接派生，避免在 renderContent 内部 filter 产生闭包陷阱）
   const currentChapterHighlights = useMemo(
     () => highlights.filter(h => h.chapterIndex === currentChapter),
@@ -1933,23 +2015,18 @@ export function Reader({
                   ) : (
                     <ChapterTree
                       chapters={chapters}
-                      // PDF 下 currentChapter 是「页码-1」，必须用 tocCurrentIndex 才能让目录高亮跟页走
-                      currentChapter={tocCurrentIndex}
+                      // PDF 下 currentChapter 是「页码-1」，与扁平索引无关，传 -1 让它永远失配；
+                      // 高亮改由 activeChapterId（章节 id 精确匹配）驱动。
+                      currentChapter={book.format === 'pdf' ? -1 : currentChapter}
+                      activeChapterId={tocActiveChapterId}
                       indexById={chapterIndexById}
                       expandedChapters={expandedChapters}
                       onToggleExpand={toggleExpand}
                       onSelectChapter={(chapterId) => {
                         if (book.format === 'pdf') {
-                          // 4.4.19：改用扁平查找。旧代码用 chapters.find 只查顶层，
-                          // 嵌套子书签点了没反应；且没有页码越界钳制。
-                          const idx = chapterIndexById.get(chapterId) ?? -1;
-                          if (idx < 0) return;
-                          const ch = flatChapters[idx];
-                          const pageFromHref = ch?.href ? parseInt(ch.href, 10) : NaN;
-                          const page = Number.isFinite(pageFromHref) && pageFromHref >= 1
-                            ? pageFromHref
-                            : idx + 1;
-                          handlePdfPageChange(page); // 钳制在 handlePdfPageChange 内做
+                          // 4.4.20：不再用 href / 扁平序号猜页码。
+                          // 有 page 走快路径，否则用原始 dest 懒解析，都失败就提示。
+                          void handlePdfTocClick(chapterId);
                         } else {
                           const idx = findChapterIndex(chapterId);
                           if (idx >= 0) changeChapter(idx);
@@ -1977,7 +2054,7 @@ export function Reader({
             <div className="hidden md:block">
               <h1 className="font-semibold truncate max-w-[300px]">
                 {book.format === 'pdf'
-                  ? (flatChapters[tocCurrentIndex]?.title || `第 ${pdfCurrentPage} 页`)
+                  ? (flatChapters[tocActiveIndex]?.title || `第 ${pdfCurrentPage} 页`)
                   : (flatChapters[currentChapter]?.title || book.title)}
               </h1>
               <p className="text-xs opacity-60">
@@ -2659,6 +2736,9 @@ export function Reader({
           }
         }} 
       />
+
+      {/* 全局轻提示：目录项无法定位、跳转失败等（4.4.20） */}
+      <Toaster position="top-center" richColors />
 
       {/* 脚注/尾注弹层：点击脚注跳转链接时显示脚注正文（隔离 iframe 无法跨文件导航，改为就地弹内容） */}
       {footnotePopover && (
