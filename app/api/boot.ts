@@ -7,6 +7,7 @@ import { createContext } from "./context";
 import { env } from "./lib/env";
 import aiProxy from "./ai-proxy";
 import mwProxy from "./mw-proxy";
+import wtProxy from "./wiktionary-proxy";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
@@ -35,6 +36,8 @@ app.use("/api/trpc/*", async (c) => {
 app.route("/api/ai", aiProxy);
 // 4.4.19：MW 词典代理，Key 只存在后端，避免随前端产物分发
 app.route("/api/mw", mwProxy);
+// 4.4.21：Wiktionary 回退源也走后端（WebView 直连该域名必超时）
+app.route("/api/wt", wtProxy);
 app.all("/api/*", (c) => c.json({ error: "Not Found" }, 404));
 
 export default app;

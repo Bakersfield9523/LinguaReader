@@ -215,9 +215,22 @@ function markProxyDownIfRefused<T>(err: T): T {
 /**
  * 生成一个可走代理的 fetch，传给 @libsql/client 的 createClient({ fetch })。
  * 代理不可用时返回的 fetch 会自动回退全局 fetch（直连）。
+ *
+ * 4.4.21：新增可选 proxyOverride。词典代理允许用 .env 的 WIKTIONARY_PROXY
+ * 显式指定出网端口，避免容器/启动器注入的 HTTP_PROXY 指向一个不允许 CONNECT
+ * 的中间代理时把请求拖到超时。不传时行为与 4.4.20 完全一致（云端同步走这里）。
  */
-export function createProxyFetch(): typeof fetch {
-  const proxy = resolveProxy();
+export function createProxyFetch(proxyOverride?: string): typeof fetch {
+  let proxy: ProxyInfo | null = null;
+  if (proxyOverride && proxyOverride.trim()) {
+    try {
+      const url = new URL(proxyOverride.trim());
+      if (url.hostname) proxy = { url, source: "env" };
+    } catch {
+      proxy = null;
+    }
+  }
+  if (!proxy) proxy = resolveProxy();
   if (!proxy) {
     console.warn("[proxy-fetch] 未能解析出网代理，云端请求将直连");
     return fetch;

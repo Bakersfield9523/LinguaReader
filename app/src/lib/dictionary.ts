@@ -8,18 +8,18 @@ import { getBackendPort } from './backend';
 // ⚠️ 绝不可再引入 VITE_MW_API_KEY：即使写在 import.meta.env.DEV 的死分支里也会被内联。
 // 开发态由 vite dev-server 同源转发到 api/boot.ts，生产态走本机后端端口（与 aiService 同款拼法）。
 const isDev = import.meta.env.DEV;
-function mwBase(): string {
+function backendBase(): string {
   return isDev ? '' : `http://localhost:${getBackendPort()}`;
 }
 
-// 回退源：Wiktionary（维基词典）API —— 免费、无需 Key、覆盖极全。
-// 为何选它而非 Free Dictionary：后者 (api.dictionaryapi.dev) 在本机 Cloudflare + 代理下 TLS 握手失败（curl exit 35），
-// 而 Wiktionary 同环境稳定 200；且浏览器/WebView 不能自定义 User-Agent，Wiktionary 不强制要求。
-const WT_API = 'https://en.wiktionary.org/w/api.php';
-// 超时：原先 10s 太长，且失败后会串行再试短语和词形还原（最坏 30s+）。
-// 现在两源并发，最坏只等 MW_TIMEOUT_MS。
+// 回退源：Wiktionary（维基词典）—— 免费、无需 Key、覆盖极全。
+// 4.4.21：不再由 WebView 直连 https://en.wiktionary.org（国内网络必超时，实测 8s+ 无响应），
+// 改走本机后端 /api/wt/:word（api/wiktionary-proxy.ts，后端用 CONNECT 隧道经出网代理取数）。
+// 这样 MW 与 Wiktionary 共用同一个 localhost 通道，后端没起来时立即失败、不再白等 6s。
+// 为何不用 Free Dictionary：后者 (api.dictionaryapi.dev) 在本机代理下 TLS 握手失败（curl exit 35）。
+// 超时：两源并发，最坏只等 MW_TIMEOUT_MS。
 const MW_TIMEOUT_MS = 5000;
-const WT_TIMEOUT_MS = 6000;
+const WT_TIMEOUT_MS = 5500;
 // 失败结果只缓存这么久：网络抖动不应该把某个词"永久判死"
 const ONLINE_FAIL_TTL_MS = 60_000;
 
@@ -248,7 +248,7 @@ function parseWiktionary(wt: string): { pos: string | undefined; defs: string[] 
 
 async function getWiktionaryDefinition(word: string): Promise<DictionaryDefinition | null> {
   try {
-    const url = `${WT_API}?action=parse&page=${encodeURIComponent(word)}&prop=wikitext&format=json&redirects=1`;
+    const url = `${backendBase()}/api/wt/${encodeURIComponent(word)}`;
     const data = await fetchJson(url, WT_TIMEOUT_MS);
     const wt = data?.parse?.wikitext?.['*'];
     if (typeof wt !== 'string' || !wt) return null;
@@ -271,7 +271,7 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
   const cacheKey = word.toLowerCase();
   let result: DictionaryDefinition | null = null;
   try {
-    const url = `${mwBase()}/api/mw/${encodeURIComponent(cacheKey)}`;
+    const url = `${backendBase()}/api/mw/${encodeURIComponent(cacheKey)}`;
     const data = await fetchJson(url, MW_TIMEOUT_MS);
     if (!Array.isArray(data) || data.length === 0) return null;
 
@@ -325,14 +325,14 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
   return result;
 }
 
-// 英文主查询：MW 优先（质量最好），Free Dictionary 回退。
+// 英文主查询：MW 优先（质量最好），Wiktionary 回退。
 // 两源并发发起——串行的话 MW 一挂就要等满超时才轮到回退源，用户感知就是"又慢又查不到"。
 async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
   const cacheKey = word.toLowerCase();
   const hit = onlineDefCache.get(cacheKey);
   if (hit && hit.exp > Date.now()) return hit.v;
 
-  const fdPromise = getWiktionaryDefinition(cacheKey);
+  const wtPromise = getWiktionaryDefinition(cacheKey);
   const mwPromise = getMwDefinition(cacheKey);
 
   let result: DictionaryDefinition | null = null;
@@ -343,7 +343,7 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
   }
   if (!result) {
     try {
-      result = await fdPromise;
+      result = await wtPromise;
     } catch {
       result = null;
     }

@@ -265,24 +265,108 @@ pub fn run() {
             .expect("error while running tauri application");
 }
 
+/// 往候选列表追加一个不重复的目录
+fn push_unique(dirs: &mut Vec<PathBuf>, p: PathBuf) {
+    if !dirs.iter().any(|d| d == &p) {
+        dirs.push(p);
+    }
+}
+
+/// 目录"像不像真正的后端运行目录"的打分。
+/// 桌面根 exe 与 Desktop\LinguaReader\ 可能同时存在候选，靠它挑出带
+/// node.exe / .env / node_modules 的那个，否则 CWD 一错位，.env 里的 MW Key、
+/// better-sqlite3 原生模块、data/ 数据库全会跑到错误位置。
+fn runtime_score(dir: &std::path::Path) -> i32 {
+    let mut s = 0;
+    if dir.join("node.exe").exists() { s += 4; }
+    if dir.join(".env").exists() { s += 2; }
+    if dir.join("node_modules").exists() { s += 1; }
+    s
+}
+
+/// 收集所有可能存放后端 bundle 的目录，按完整度降序（稳定排序，同级保持加入顺序）。
+///
+/// 4.4.21：桌面根 exe（Desktop\LinguaReader.exe）与真正的运行目录
+/// （Desktop\LinguaReader\，含 boot.js / node.exe / .env / node_modules）不在同一层。
+/// 旧实现只查 exe 同目录 + resource_dir + 两个相对路径，全部落空 → 后端根本没启动。
+/// 表现就是「词典所有词都找不到解析」，且登录 / 云同步 / AI 一并失效。
+fn backend_dirs(handle: &tauri::AppHandle, exe_dir: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // 1) 常规松散分发：exe 与 boot.js 同目录
+    if let Some(d) = exe_dir {
+        push_unique(&mut dirs, d.to_path_buf());
+    }
+    // 2) NSIS 安装包：boot.js 作为 resource 释放
+    if let Ok(rd) = handle.path().resource_dir() {
+        push_unique(&mut dirs, rd);
+    }
+
+    if let Some(d) = exe_dir {
+        // 3) 桌面根 exe：运行目录是同名的子目录
+        for name in ["LinguaReader", "linguareader", "LINGUAREADER", "runtime"] {
+            push_unique(&mut dirs, d.join(name));
+        }
+        // 4) 兜底：扫一层子目录，只认「有 boot.js 且带运行依赖」的目录，
+        //    避免用户把运行目录改了名字后又要改代码
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() || !p.join("boot.js").exists() {
+                    continue;
+                }
+                if p.join("node.exe").exists()
+                    || p.join(".env").exists()
+                    || p.join("node_modules").exists()
+                {
+                    push_unique(&mut dirs, p);
+                }
+            }
+        }
+        // 5) 源码 / dev 布局
+        push_unique(&mut dirs, d.join("app").join("dist"));
+        push_unique(&mut dirs, d.join("dist"));
+        if let Some(parent) = d.parent() {
+            push_unique(&mut dirs, parent.join("app").join("dist"));
+        }
+    }
+
+    // sort_by 是稳定排序：分数相同保持上面的优先级
+    dirs.sort_by(|a, b| runtime_score(b).cmp(&runtime_score(a)));
+    dirs
+}
+
+/// 生成 Node 能正常解析的绝对路径。
+/// ⚠️ 绝不可用 `std::fs::canonicalize()`：Windows 上它返回 `\\?\C:\...` 长路径前缀，
+/// Node 22 的 `realpathSync` 在解析入口脚本时会把 `C:` 当目录，直接抛
+/// `EISDIR: illegal operation on a directory, lstat 'C:'`，后端起不来。
+/// backend_dirs 里的候选本来就来自 current_exe()/resource_dir()，已是绝对路径，
+/// 这里只对少数相对候选做一次不带 verbatim 前缀的补全。
+fn plain_absolute(p: &std::path::Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
+/// 把后端启动诊断写进 backend.log（release 构建没有日志插件，log::* 是空操作）
+fn append_backend_diag(log_path: &Option<PathBuf>, msg: &str) {
+    use std::io::Write;
+    if let Some(p) = log_path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }
+}
+
 fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
-    // 资源目录（安装包场景：boot.js 由 NSIS 放入 resource_dir）
-    let resource_dir = handle.path().resource_dir().ok();
-    // 松散分发场景：boot.js 与 exe 同目录（或 exe 上级的 app/dist），
-    // 否则 loose exe 找不到后端脚本，导致整个后端无法启动、注册/登录全部 Failed to fetch。
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = &exe_dir {
-        candidates.push(dir.join("boot.js"));
-        candidates.push(dir.join("../app/dist/boot.js"));
-    }
-    if let Some(rd) = &resource_dir {
-        candidates.push(rd.join("boot.js"));
-    }
-    candidates.push(std::path::PathBuf::from("../app/dist/boot.js"));
-    candidates.push(std::path::PathBuf::from("app/dist/boot.js"));
 
     // 日志路径：应用数据目录下的 backend.log（便于排查启动失败）
     let log_path: Option<PathBuf> = handle
@@ -291,37 +375,69 @@ fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
         .ok()
         .map(|d| d.join("backend.log"));
 
+    let searched = backend_dirs(handle, exe_dir.as_deref());
+    let candidates: Vec<PathBuf> = searched
+        .iter()
+        .map(|d| d.join("boot.js"))
+        .filter(|p| p.exists())
+        .collect();
+
+    if candidates.is_empty() {
+        let msg = format!(
+            "[rust] backend boot.js NOT FOUND | exe_dir={:?} | searched={:?}",
+            exe_dir, searched
+        );
+        log::error!("{}", msg);
+        append_backend_diag(&log_path, &msg);
+        return None;
+    }
+
     for backend_script in &candidates {
-        if backend_script.exists() {
-            log::info!("Starting backend: {:?} on port {}", backend_script, port);
-            let work_dir = backend_script
+        let work_dir = backend_script
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
+        // 绝对路径：相对候选（app/dist/boot.js）在改了 current_dir 之后会解析错位。
+        // 只能补成普通绝对路径，见 plain_absolute 里关于 \\?\ 前缀的说明。
+        let script_abs = plain_absolute(backend_script);
+        let work_abs = plain_absolute(&work_dir);
 
-            // 优先使用与 exe 同目录的 node.exe，避免系统 PATH 上其它 Node 版本
-            // 导致 better-sqlite3 等原生模块 ABI 不兼容（例：v24 ABI 137 vs v22 ABI 127）。
-            let node_bin = exe_dir
-                .as_ref()
-                .map(|d| d.join("node.exe"))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from("node"));
-            log::info!("Using node binary: {:?}", node_bin);
+        // 4.4.21：node.exe 优先取 **boot.js 所在目录**，而不是 exe 所在目录。
+        // 桌面根 exe 同目录没有 node.exe，旧实现会退化到系统 PATH 上的 node，
+        // 而系统 Node 的 ABI 往往与运行目录里的 better-sqlite3 不匹配。
+        let node_bin = [
+            Some(work_abs.join("node.exe")),
+            exe_dir.as_ref().map(|d| d.join("node.exe")),
+            handle.path().resource_dir().ok().map(|d| d.join("node.exe")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("node"));
 
-            match Command::new(&node_bin)
-                .arg(backend_script)
-                .current_dir(work_dir)
-                .env("NODE_ENV", "production")
-                .env("PORT", port.to_string())
-                .stdout(log_stdio(&log_path))
-                .stderr(log_stdio(&log_path))
-                .spawn()
-            {
-                Ok(child) => return Some(child),
-                Err(e) => log::error!("Failed to start backend: {}", e),
+        let msg = format!(
+            "[rust] starting backend on port {} | script={:?} | work_dir={:?} | node={:?}",
+            port, script_abs, work_abs, node_bin
+        );
+        log::info!("{}", msg);
+        append_backend_diag(&log_path, &msg);
+
+        match Command::new(&node_bin)
+            .arg(&script_abs)
+            .current_dir(&work_abs)
+            .env("NODE_ENV", "production")
+            .env("PORT", port.to_string())
+            .stdout(log_stdio(&log_path))
+            .stderr(log_stdio(&log_path))
+            .spawn()
+        {
+            Ok(child) => return Some(child),
+            Err(e) => {
+                let msg = format!("[rust] failed to start backend {:?}: {}", script_abs, e);
+                log::error!("{}", msg);
+                append_backend_diag(&log_path, &msg);
             }
         }
     }
-    log::error!("Backend script not found");
     None
 }
