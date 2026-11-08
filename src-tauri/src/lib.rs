@@ -1,6 +1,8 @@
 use std::process::{Command, Child, Stdio};
 use std::sync::Mutex;
-use std::net::{TcpListener, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::time::Duration;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use serde::Serialize;
@@ -9,6 +11,9 @@ use tauri::State;
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 static BACKEND: Mutex<Option<Child>> = Mutex::new(None);
+
+// 4.4.22：主窗口销毁时置位，让守护线程停止，避免应用退出后继续拉起后端。
+static BACKEND_WATCHDOG_STOP: AtomicBool = AtomicBool::new(false);
 
 // 后端实际监听端口：Rust 在启动时探测空闲端口后写入，前端通过 get_backend_port 读取。
 // 这样即使 3000 被常驻软件占用，也能自动换端口，避免 "Failed to fetch"。
@@ -252,12 +257,21 @@ pub fn run() {
                 log::error!("Backend failed to start (node not found or spawn error)");
             }
 
+            // 4.4.22：守护线程兜底。实测后端会「启动成功后被外部终止」（无崩溃堆栈），
+            // 只靠启动一次不够；掉线后自动重拉，用户点词才有稳定可用的后端。
+            BACKEND_WATCHDOG_STOP.store(false, Ordering::Relaxed);
+            spawn_backend_watchdog(app.handle().clone(), port);
+
             Ok(())
         })
-        .on_window_event(|_window, event| {
+        .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                if let Some(ref mut child) = *BACKEND.lock().unwrap() {
-                    let _ = child.kill();
+                // 只认主窗口；先置停止位再 kill，避免守护线程把刚 kill 的后端又拉起来。
+                if window.label() == "main" {
+                    BACKEND_WATCHDOG_STOP.store(true, Ordering::Relaxed);
+                    if let Some(ref mut child) = *BACKEND.lock().unwrap() {
+                        let _ = child.kill();
+                    }
                 }
             }
         })
@@ -440,4 +454,140 @@ fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
         }
     }
     None
+}
+
+// ============ 4.4.22 后端守护 ============
+
+/// 端口上是否真的有服务在监听（后端只绑 127.0.0.1）。
+/// 连到未监听的回环端口会立刻 ECONNREFUSED，不会真的等满超时。
+fn backend_port_alive(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
+}
+
+/// 后端 child 是否仍在运行（没有 child 也算 false）。
+fn backend_child_running() -> bool {
+    let mut guard = BACKEND.lock().unwrap();
+    match guard.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
+/// 分段休眠：应用退出时守护线程能在 100ms 内结束，而不是卡在整段 sleep。
+fn watchdog_sleep(secs: u32) -> bool {
+    for _ in 0..secs.saturating_mul(10) {
+        if BACKEND_WATCHDOG_STOP.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !BACKEND_WATCHDOG_STOP.load(Ordering::Relaxed)
+}
+
+/// 后端守护线程。
+///
+/// 4.4.22 真机排查发现：后端会「启动成功（Server running）后被外部终止」，
+/// backend.log 里没有任何 Node 崩溃堆栈，代码里也没有 process.exit。此时
+/// WebView 查词得到 ERR_CONNECTION_REFUSED，用户看到「找不到解析」。
+/// 守护线程不追究终止原因，只要端口掉线就在数秒内重新拉起。
+///
+/// ⚠️ 必须复用启动时写进 BackendState 的同一个 port：前端 initBackendPort()
+/// 只在启动时读一次端口，重新 find_free_port 会让前端继续连旧端口。
+fn spawn_backend_watchdog(handle: tauri::AppHandle, port: u16) {
+    std::thread::spawn(move || {
+        let log_path: Option<PathBuf> = handle
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|d| d.join("backend.log"));
+
+        let mut misses: u32 = 0;
+        let mut cooldown_secs: u32 = 0;
+        // 是否曾真正就绪过（端口可连）。就绪前算「启动中」，就绪后才算「掉线」。
+        let mut ever_ready = false;
+        let mut started_at = std::time::Instant::now();
+
+        loop {
+            if !watchdog_sleep(1) {
+                return;
+            }
+            if cooldown_secs > 0 {
+                cooldown_secs -= 1;
+                continue;
+            }
+
+            // 端口可连即视为后端可用（若同端口是另一个实例，词典照样能用，不抢）。
+            if backend_port_alive(port) {
+                ever_ready = true;
+                misses = 0;
+                continue;
+            }
+
+            // ⚠️ 关键：不能只给固定秒数的「启动宽限」。
+            // Node 加载 1MB boot.js + better-sqlite3 + @libsql/client 到真正 listen
+            // 需要 5s 以上；宽限给短了，watchdog 会把刚拉起的后端自己 kill 掉，
+            // 形成「重启 → 还没 listen → 判定掉线 → 再 kill」的无限重启循环
+            // （4.4.22 首版真机日志 63048→85152→15920→83096 就是这个循环）。
+            // 判据改为：从未就绪时，进程还在就耐心等它启动（45s），
+            // 进程已退出说明启动失败，5s 后即重试；一旦就绪过，掉线立即按 2 次探测处理。
+            if !ever_ready {
+                let running = backend_child_running();
+                let wait_secs = if running { 45 } else { 5 };
+                if started_at.elapsed() < Duration::from_secs(wait_secs) {
+                    continue;
+                }
+            }
+
+            // 连续 2 次失联才动手
+            misses += 1;
+            if misses < 2 {
+                continue;
+            }
+            misses = 0;
+
+            if BACKEND_WATCHDOG_STOP.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let child_running = backend_child_running();
+            append_backend_diag(
+                &log_path,
+                &format!(
+                    "[rust/wd] backend down on 127.0.0.1:{} (ever_ready={}, child_running={}), restarting",
+                    port, ever_ready, child_running
+                ),
+            );
+
+            let ok = {
+                let mut guard = BACKEND.lock().unwrap();
+                if let Some(ref mut old) = *guard {
+                    let _ = old.kill();
+                    let _ = old.wait();
+                }
+                match start_backend(&handle, port) {
+                    Some(child) => {
+                        append_backend_diag(
+                            &log_path,
+                            &format!("[rust/wd] backend restarted, pid={}", child.id()),
+                        );
+                        *guard = Some(child);
+                        true
+                    }
+                    None => {
+                        append_backend_diag(&log_path, "[rust/wd] restart failed, will retry");
+                        *guard = None;
+                        false
+                    }
+                }
+            };
+            // 重启后重新进入「启动中」状态，等新 Node 真正 listen
+            ever_ready = false;
+            started_at = std::time::Instant::now();
+            // 连续重启失败时限速，避免日志刷屏与 CPU 空转
+            if !ok {
+                cooldown_secs = 10;
+            }
+        }
+    });
 }

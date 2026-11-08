@@ -47,27 +47,28 @@ if (env.isProduction) {
   const { serveStaticFiles } = await import("./lib/vite");
   serveStaticFiles(app);
 
-  // 远程数据库（Turso/libSQL）初始化：在监听端口前确保云端连接与表结构就绪。
-  // 用 try/catch 包裹：云端配置错误或网络不可达时，绝不影响本地 SQLite 后端的启动，
-  // 避免“云端没配好 → 整个世界（注册/登录/书架）全部 Failed to fetch”的连锁崩溃。
-  // 4.4.16：再加 25s 整体超时——逐条建表各带 20s 请求超时，最坏情况会拖到几分钟，
-  // 超时后走本地兜底，云端之后仍可由 sync 端点按冷却时间自动重连（ensureRemoteReady）。
-  const { initRemoteDb } = await import("./queries/connection");
-  try {
-    await Promise.race([
-      initRemoteDb(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("云端初始化超时（25s）")), 25_000),
-      ),
-    ]);
-  } catch (e) {
-    console.error("initRemoteDb failed, falling back to local SQLite:", e);
-  }
-
   const port = parseInt(process.env.PORT || "3000");
+  // 4.4.22：先监听端口，再把云端初始化放到后台。
+  // 旧版把 initRemoteDb（最长 25s，逐条建表还要经出网代理）放在 serve 之前，
+  // 应用刚打开的这段窗口里 /api/mw、/api/wt 全部「连接被拒」，用户点词必然
+  // 得到「找不到解析」；前端又会把这次失败缓存下来，后端就绪后依旧查不出来。
+  // 词典 / AI / 本地 SQLite 完全不依赖云端，没理由等它。
   // 4.4.19：只监听回环地址。此前未传 hostname → Node 绑到 ::（所有网卡），
   // 公共 WiFi 下同网段机器可直接访问本机 API（含无鉴权的 /api/ai）。
   serve({ fetch: app.fetch, port, hostname: "127.0.0.1" }, () => {
     console.log(`Server running on http://127.0.0.1:${port}/`);
+  });
+
+  // 云端配置错误或网络不可达时，绝不影响本地服务（本地 SQLite 兜底）。
+  // 25s 整体超时后走本地，云端之后仍可由 sync 端点按冷却时间自动重连
+  // （ensureRemoteReady）；这里不 await，只 fire-and-forget 并吞掉异常。
+  const { initRemoteDb } = await import("./queries/connection");
+  void Promise.race([
+    initRemoteDb(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("云端初始化超时（25s）")), 25_000),
+    ),
+  ]).catch((e) => {
+    console.error("initRemoteDb failed, falling back to local SQLite:", e);
   });
 }

@@ -3,7 +3,7 @@ import {
   ArrowLeft, BookOpen, Settings, Type, Moon, Sun, Highlighter, X,
   ChevronLeft, ChevronRight, List, Loader2, Sparkles, Volume2,
   ChevronDown, ChevronUp, Bookmark as BookmarkIcon, BookmarkPlus as BookmarkPlusIcon, Trash2,
-  PenLine, Underline
+  PenLine, Underline, RefreshCw
 } from 'lucide-react';
 import { AIChatPanel } from './AIChatPanel';
 import { PDFCanvasViewer } from './PDFCanvasViewer';
@@ -12,7 +12,13 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { lookupWord, getQuickTranslation } from '@/lib/dictionary';
+import { lookupWord, getQuickTranslation, clearOnlineFailures } from '@/lib/dictionary';
+import {
+  readDictCache,
+  writeDictCache,
+  clearDictFailures,
+  type DictCacheMap,
+} from '@/lib/dictCache';
 import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob, stripHtmlToText, countTextUnits } from '@/lib/fileParser';
 import { resolveFontStack, normalizeFontToken } from '@/lib/fonts';
 import { BookDB, HighlightDB } from '@/lib/db';
@@ -361,7 +367,9 @@ export function Reader({
   // ===== 性能优化：词典/AI 结果缓存 =====
   // 同一本书内重复点击同一单词很常见（复习）。缓存命中时跳过网络请求，
   // 直接显示历史结果，体感速度从 ~3s → ~10ms。
-  const dictCacheRef = useRef<Map<string, DictionaryDefinition | null>>(new Map());
+  // 4.4.22：失败结果只缓存 8s（见 lib/dictCache.ts）。旧实现把 null 永久缓存，
+  // 后端启动窗口期点过一次词就会让这个词在本窗口里永远「找不到解析」。
+  const dictCacheRef = useRef<DictCacheMap<DictionaryDefinition>>(new Map());
   const aiCacheRef = useRef<Map<string, AIContextResponse | null>>(new Map());
   // 跟踪"当前请求的 generation"——切到新词后旧请求的 setState 应该被丢弃
   const dictGenRef = useRef(0);
@@ -1333,10 +1341,10 @@ export function Reader({
       const myDictGen = ++dictGenRef.current;
       const myAiGen = ++aiGenRef.current;
 
-      // 1) 词典查询：先查缓存
+      // 1) 词典查询：先查缓存（undefined = 未命中/已过期，null = 命中了"查过且没结果"）
       const dictCacheKey = `${book.language}::${cleanWord}`;
-      let definition = dictCacheRef.current.get(dictCacheKey);
-      if (definition === undefined) { // 缓存未命中（注意：null 表示"已查过且没结果"也要缓存）
+      let definition = readDictCache(dictCacheRef.current, dictCacheKey);
+      if (definition === undefined) {
         setAiData(null);
         try {
           definition = await lookupWord(cleanWord, book.language);
@@ -1344,7 +1352,8 @@ export function Reader({
           console.error('词典查询失败:', dictErr);
           definition = null;
         }
-        dictCacheRef.current.set(dictCacheKey, definition ?? null);
+        // 成功长期缓存；失败只缓存 8s，后端恢复后自动可重查
+        writeDictCache(dictCacheRef.current, dictCacheKey, definition ?? null);
       }
       // 期间用户可能已切换到别的词
       if (myDictGen !== dictGenRef.current) return;
@@ -2607,19 +2616,40 @@ export function Reader({
                         )}
                       </div>
                     ) : (
-                      <p className="text-sm opacity-60 py-4">
-                        {book.language === 'fr'
-                          ? '未找到该单词的法语释义'
-                          : book.language === 'de'
-                          ? '未找到该单词的德语释义'
-                          : book.language === 'ja'
-                          ? '未找到该单词的日语释义'
-                          : book.language === 'uk'
-                          ? '未找到该单词的乌克兰语释义'
-                          : book.language === 'pl'
-                          ? '未找到该单词的波兰语释义'
-                          : 'No definition found for this word'}
-                      </p>
+                      <div className="space-y-3 py-2">
+                        <p className="text-sm opacity-60">
+                          {book.language === 'fr'
+                            ? '未找到该单词的法语释义'
+                            : book.language === 'de'
+                            ? '未找到该单词的德语释义'
+                            : book.language === 'ja'
+                            ? '未找到该单词的日语释义'
+                            : book.language === 'uk'
+                            ? '未找到该单词的乌克兰语释义'
+                            : book.language === 'pl'
+                            ? '未找到该单词的波兰语释义'
+                            : 'No definition found for this word'}
+                        </p>
+                        <p className="text-[11px] opacity-40 leading-relaxed">
+                          应用刚打开时后台服务可能仍在启动，稍等后重试即可。
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!selectedWord) return;
+                            // 4.4.22：失败结果缓存在两层（Reader 组件层 + dictionary.ts
+                            // 的 onlineDefCache），必须一起清，只清一层按钮等于没用。
+                            // 全量清失败项而非按单词 key 清，避免标点/大小写规范化不一致漏清。
+                            clearDictFailures(dictCacheRef.current);
+                            clearOnlineFailures();
+                            void handleWordClick(selectedWord);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-current/15 px-3 py-1.5 text-xs opacity-70 hover:opacity-100 transition-opacity"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          重试词典
+                        </button>
+                      </div>
                     )}
                   </div>
 

@@ -20,8 +20,11 @@ function backendBase(): string {
 // 超时：两源并发，最坏只等 MW_TIMEOUT_MS。
 const MW_TIMEOUT_MS = 5000;
 const WT_TIMEOUT_MS = 5500;
-// 失败结果只缓存这么久：网络抖动不应该把某个词"永久判死"
-const ONLINE_FAIL_TTL_MS = 60_000;
+// 失败结果只缓存这么久：网络抖动不应该把某个词"永久判死"。
+// 4.4.22：由 60s 缩到 15s——后端掉线后 Rust watchdog 约 2s 发现 + 约 5s 让
+// Node 冷启动到 listen（实测恢复约 7s）；60s 会让「后端已恢复但这个词还是
+// 查不到」拖太久，8s 又太紧，取 15s。
+const ONLINE_FAIL_TTL_MS = 15_000;
 
 // 本地词典条目通用接口
 interface LocalDictEntry {
@@ -187,6 +190,18 @@ function buildMwAudioUrl(audio: string): string {
 // 在线释义缓存：成功长期缓存，失败只缓存 ONLINE_FAIL_TTL_MS
 const onlineDefCache = new Map<string, { v: DictionaryDefinition | null; exp: number }>();
 
+/**
+ * 4.4.22：清掉所有「查过但失败」的在线缓存项（成功项保留）。
+ * 供「重试词典」按钮调用——它只清 Reader.tsx 那层缓存是不够的，
+ * 这里还有第二层；按单词 key 清又会因标点/大小写规范化不一致而漏掉，
+ * 所以直接扫一遍失败项全清，最稳。
+ */
+export function clearOnlineFailures(): void {
+  for (const [key, entry] of onlineDefCache) {
+    if (!entry.v) onlineDefCache.delete(key);
+  }
+}
+
 // 带超时的 JSON 拉取（失败一律返回 null，交由上层回退）
 async function fetchJson(url: string, ms: number): Promise<any> {
   const controller = new AbortController();
@@ -325,16 +340,10 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
   return result;
 }
 
-// 英文主查询：MW 优先（质量最好），Wiktionary 回退。
-// 两源并发发起——串行的话 MW 一挂就要等满超时才轮到回退源，用户感知就是"又慢又查不到"。
-async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
-  const cacheKey = word.toLowerCase();
-  const hit = onlineDefCache.get(cacheKey);
-  if (hit && hit.exp > Date.now()) return hit.v;
-
+// 一轮查询：MW 与 Wiktionary 并发，MW 成功优先
+async function queryEnglishOnce(cacheKey: string): Promise<DictionaryDefinition | null> {
   const wtPromise = getWiktionaryDefinition(cacheKey);
   const mwPromise = getMwDefinition(cacheKey);
-
   let result: DictionaryDefinition | null = null;
   try {
     result = await mwPromise;
@@ -348,7 +357,32 @@ async function getEnglishDefinition(word: string): Promise<DictionaryDefinition 
       result = null;
     }
   }
-  // 成功长期缓存；失败只缓存 60s，网络恢复后可重试
+  return result;
+}
+
+// 英文主查询：MW 优先（质量最好），Wiktionary 回退。
+// 两源并发发起——串行的话 MW 一挂就要等满超时才轮到回退源，用户感知就是"又慢又查不到"。
+async function getEnglishDefinition(word: string): Promise<DictionaryDefinition | null> {
+  const cacheKey = word.toLowerCase();
+  const hit = onlineDefCache.get(cacheKey);
+  if (hit && hit.exp > Date.now()) return hit.v;
+
+  let result = await queryEnglishOnce(cacheKey);
+  // 4.4.22：两源全灭最常见的原因是「应用刚打开、Node 后端还没监听」或
+  // 「后端进程被终止、Rust watchdog 正在重拉」——都是瞬时故障，不是词没释义。
+  // 连接被拒时 fetch 会立刻失败（不占 5s 超时），所以多试几轮很便宜；
+  // 3 轮约覆盖 1.8s，配合 watchdog 的 2~3s 恢复窗口与 8s 失败 TTL。
+  for (let attempt = 1; !result && attempt < 3; attempt++) {
+    await new Promise((r) => setTimeout(r, 900));
+    result = await queryEnglishOnce(cacheKey);
+  }
+  if (!result) {
+    console.warn(
+      `[dictionary] 英文两源均失败：${cacheKey}；后端=${backendBase() || '(dev 同源)'}。` +
+      '若持续失败，请确认 LinguaReader 后端进程已启动。',
+    );
+  }
+  // 成功长期缓存；失败只缓存 8s，后端恢复后可重试
   onlineDefCache.set(cacheKey, {
     v: result,
     exp: result ? Number.MAX_SAFE_INTEGER : Date.now() + ONLINE_FAIL_TTL_MS,
