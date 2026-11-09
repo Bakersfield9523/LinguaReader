@@ -1,4 +1,6 @@
 use std::process::{Command, Child, Stdio};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -436,15 +438,21 @@ fn start_backend(handle: &tauri::AppHandle, port: u16) -> Option<Child> {
         log::info!("{}", msg);
         append_backend_diag(&log_path, &msg);
 
-        match Command::new(&node_bin)
-            .arg(&script_abs)
+        let mut cmd = Command::new(&node_bin);
+        cmd.arg(&script_abs)
             .current_dir(&work_abs)
             .env("NODE_ENV", "production")
             .env("PORT", port.to_string())
             .stdout(log_stdio(&log_path))
-            .stderr(log_stdio(&log_path))
-            .spawn()
-        {
+            .stderr(log_stdio(&log_path));
+        // 4.4.23：node.exe 是 Windows 控制台子系统程序。不加 CREATE_NO_WINDOW(0x08000000)
+        // 时，Windows 会为它单独分配一个可见控制台窗口——也就是用户每次打开软件
+        // 都看到的那个"终端"。后端 stdout/stderr 已重定向到 backend.log，隐藏窗口
+        // 完全不影响字典/登录/云同步/AI 等任何功能，watchdog 重拉也走同一路径。
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+        match cmd.spawn() {
+
             Ok(child) => return Some(child),
             Err(e) => {
                 let msg = format!("[rust] failed to start backend {:?}: {}", script_abs, e);
