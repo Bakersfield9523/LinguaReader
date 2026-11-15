@@ -27,6 +27,10 @@ interface WordBox {
   itemIdx: number;
   rawStart: number;
   rawEnd: number;
+  // 断词续接标志：本 text item 以行末断词连字符结尾（如 "doc-" / "reason-"），
+  // 词在下一行续接。仅用于 compoundNorm / 选中文本续接判断，绝不进入 word.text，
+  // 否则高亮文本会带上断词连字符（如 "doctrines-"）且视觉框会盖到行末连字符字形。
+  joinsNext?: boolean;
 }
 
 interface HlEntry {
@@ -498,7 +502,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     for (let i = 0; i < words.length; i++) {
       let j = i;
       let txt = words[i].text;
-      while (j + 1 < words.length && HYPHEN_RE.test(words[j].text.slice(-1))) {
+      while (j + 1 < words.length && words[j].joinsNext) {
         j++;
         txt += words[j].text;
       }
@@ -515,7 +519,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
       if (covered.has(i)) continue;
       if (marked.has(compoundNorm[i])) {
         let j = i;
-        while (j + 1 < words.length && HYPHEN_RE.test(words[j].text.slice(-1))) j++;
+        while (j + 1 < words.length && words[j].joinsNext) j++;
         for (let k = i; k <= j; k++) if (!covered.has(k)) markedIndices.push(k);
       }
     }
@@ -894,7 +898,15 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     if (!words.length) return;
 
     const parts: string[] = [];
-    for (let i = s; i <= en && i < words.length; i++) parts.push(words[i].text);
+    for (let i = s; i <= en && i < words.length; i++) {
+      if (i > s && words[i - 1].joinsNext) {
+        // 行末断词续接：把下一行续词直接拼回（如 "doc" + "trines" → "doctrines"），
+        // 去掉换行产生的连字符与缝隙，避免选中文本出现 "doctrines-" 这种去不掉的连字符。
+        parts[parts.length - 1] += words[i].text;
+      } else {
+        parts.push(words[i].text);
+      }
+    }
     const text = parts.join(' ').trim();
     if (text.length < 1) return;
 
@@ -1113,8 +1125,12 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
       const cleanStart = match.index!;
       const cleanEnd = cleanStart + rawWord.length;
 
-      // 连字符续词：前半词补回连字符（同词 "well-known" 正则已含连字符，此处不会重复补）
-      const word = itemEndsWithHyphen && !HYPHEN_RE.test(rawWord.slice(-1)) ? rawWord + item.rawStr.slice(cleanEnd).match(HYPHEN_RE)?.[0] || '-' : rawWord;
+      // 断词续接：行末 hyphenation（"doc-" / "reason-"）的连字符是换行包装产生的，
+      // 不属于词本身。这里只记 joinsNext 标志供续词判断/选中文本合并使用，
+      // 绝不再把连字符并回 word.text（否则高亮文本会带 "doctrines-"，且视觉框会盖到
+      // 行末那个连字符字形导致高亮渲染异常）。同词内的真连字符（"well-known"）
+      // item 不以连字符结尾，itemEndsWithHyphen 为 false，原样保留。
+      const word = rawWord;
 
       let cleanPos = 0, rawStart = -1, rawEnd = item.rawStr.length;
       for (let ri = 0; ri < item.rawStr.length; ri++) {
@@ -1123,8 +1139,8 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
         if (cleanPos === cleanEnd) { rawEnd = ri + 1; break; }
       }
       if (rawStart < 0) rawStart = 0;
-      // 续词连字符也算进高亮范围（盖住那个连字符字形）
-      if (itemEndsWithHyphen) rawEnd = item.rawStr.length;
+      // 注：不再因续词把 rawEnd 延伸到连字符——连字符字形由行末换行处理，
+      // 高亮只盖真实词字母，避免延伸到错位的连字符位置。
 
       let prefixWidth = 0, wordWidth = 0;
       const totalScaledWidth = item.width * viewport.scale;
@@ -1163,6 +1179,7 @@ function buildBoxes(items: any[], viewport: pdfjs.PageViewport): WordBox[] {
         itemIdx: item.spanIdx,
         rawStart,
         rawEnd,
+        joinsNext: itemEndsWithHyphen,
       });
     }
   }
