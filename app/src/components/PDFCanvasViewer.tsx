@@ -147,6 +147,9 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
   const pendingHighlightReloadRef = useRef(false);
   // Render generation counter to prevent stale async results from overwriting state
   const renderGenerationRef = useRef(0);
+  // 跟踪当前正在进行的 page.render() 任务，翻页/缩放时用于取消并等待释放 canvas，
+  // 避免 "Cannot use the same canvas during multiple render() operations"。
+  const renderTaskRef = useRef<any>(null);
 
   // Sync marked words from props into ref, 并立即重绘。
   // ⚠️ 关键修复：drawAllOverlays 读的是 markedSetRef.current，而它只在 effect 里更新。
@@ -286,6 +289,7 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     if (!pdfRef.current || pageNum < 1 || totalPages < 1) return;
     const generation = ++renderGenerationRef.current;
     let cancelled = false;
+    let localTask: any = null;
     wordsRef.current = [];
     hlEntriesRef.current = [];
     selRangeRef.current = null;
@@ -304,6 +308,16 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         const canvas = canvasRef.current;
         if (!canvas) return;
 
+        // 取消上一个仍在进行中的渲染任务并等待其真正释放 canvas，否则新的
+        // page.render() 会抛 "Cannot use the same canvas during multiple
+        // render() operations"（快速翻页 / JPX 图片解码较慢时尤易触发）。
+        if (renderTaskRef.current) {
+          const prev = renderTaskRef.current;
+          renderTaskRef.current = null;
+          try { prev.cancel(); } catch { /* ignore */ }
+          try { await prev.promise; } catch { /* 取消会抛 RenderingCancelledException，忽略 */ }
+        }
+
         canvas.width = Math.floor(cssW * dpr);
         canvas.height = Math.floor(cssH * dpr);
         canvas.style.width = `${cssW}px`;
@@ -312,7 +326,17 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
         const ctx = canvas.getContext('2d')!;
         ctx.save();
         ctx.scale(dpr, dpr);
-        await page.render({ canvasContext: ctx, viewport }).promise;
+        const renderTask = page.render({ canvasContext: ctx, viewport });
+        localTask = renderTask;
+        renderTaskRef.current = renderTask;
+        try {
+          await renderTask.promise;
+        } catch (e: any) {
+          if (e?.name === 'RenderingCancelledException') { ctx.restore(); return; }
+          throw e;
+        }
+        if (renderTaskRef.current === renderTask) renderTaskRef.current = null;
+        localTask = null;
         ctx.restore();
         viewportRef.current = viewport;
 
@@ -379,13 +403,20 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
           drawAllOverlays();
         }
       } catch (e: any) {
+        if (e?.name === 'RenderingCancelledException') return; // 主动取消，非错误
         console.error('[PDF] render error:', e);
         if (!cancelled && generation === renderGenerationRef.current) {
           setRenderError(e?.message || 'PDF 页面渲染失败');
         }
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (localTask) {
+        try { localTask.cancel(); } catch { /* ignore */ }
+        localTask = null;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageNum, scale, totalPages]);
 
