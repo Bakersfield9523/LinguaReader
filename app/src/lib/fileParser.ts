@@ -1524,7 +1524,15 @@ export class PDFParser {
     // 传递 ArrayBuffer 的副本，避免被 worker transfer 后原始 buffer 被分离
     const data = new Uint8Array(arrayBuffer.slice(0));
     try {
-      this.pdf = await pdfjs.getDocument({ data }).promise;
+      // 4.4.24：提供 pdf.js 可选解码器资源（JPEG2000/JBIG2/ICC 走 wasm，
+      // CJK 走 cmaps，非内嵌标准字体走 standardFontData）。路径对应
+      // public/pdf-assets/；缺失 wasmUrl 会导致 JPX/JBIG2 图片整页空白。
+      this.pdf = await pdfjs.getDocument({
+        data,
+        cMapUrl: '/pdf-assets/cmaps/',
+        standardFontDataUrl: '/pdf-assets/standard_fonts/',
+        wasmUrl: '/pdf-assets/wasm/',
+      }).promise;
     } catch (e: any) {
       console.error('[PDF] getDocument failed:', e?.message || e);
       throw e;

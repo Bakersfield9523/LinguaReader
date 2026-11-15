@@ -239,14 +239,25 @@ const PDFCanvasViewer = memo(function PDFCanvasViewerInternal({
     (async () => {
       try {
         const bytes = new Uint8Array(await fileDataToArrayBuffer(fileData));
+        // 4.4.24：提供 pdf.js 可选解码器资源。JPEG2000(JPX)/JBIG2 图片与 ICC
+        // 色彩管理走 wasm 解码器；CJK 文本走 cmaps；非内嵌标准字体走
+        // standardFontData。不设置 wasmUrl 时 pdf.js 会静默跳过 JPX/JBIG2 图片
+        // → 整页空白（Edge/PDFium 能解故正常）。路径对应 public/pdf-assets/。
+        const pdfjsAssetBase = '/pdf-assets/';
+        const docInit = {
+          data: bytes,
+          cMapUrl: pdfjsAssetBase + 'cmaps/',
+          standardFontDataUrl: pdfjsAssetBase + 'standard_fonts/',
+          wasmUrl: pdfjsAssetBase + 'wasm/',
+        };
         let pdf: pdfjs.PDFDocumentProxy | undefined;
         try {
-          pdf = await pdfjs.getDocument({ data: bytes }).promise;
+          pdf = await pdfjs.getDocument(docInit).promise;
         } catch (firstErr: any) {
           // 部分环境（如 Tauri 生产包）worker 加载/执行异常会导致加载失败，
           // 回退到禁用 worker 的主线程渲染模式
           pdfjs.GlobalWorkerOptions.workerSrc = '';
-          pdf = await pdfjs.getDocument({ data: bytes }).promise;
+          pdf = await pdfjs.getDocument(docInit).promise;
         }
         if (cancelled) { pdf.destroy(); return; }
         pdfRef.current = pdf;
