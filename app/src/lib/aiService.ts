@@ -38,6 +38,12 @@ export interface ApiKeyTestResult {
   error?: string;
 }
 
+// 追问用的历史对话轮次（不含 system，system 每次请求单独构造）
+export interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 // ============ 提供商配置 ============
 
 export const AI_PROVIDERS: Record<AIProvider, AIProviderConfig> = {
@@ -166,10 +172,14 @@ async function callAICompletion(
   systemPrompt: string,
   userPrompt: string,
   temperature: number = 0.3,
-  maxTokens: number = 800
+  maxTokens: number = 800,
+  history: ChatTurn[] = []
 ): Promise<string> {
+  // system 每次单独构造；history 为之前的多轮对话（追问上下文）；userPrompt 为当前这一句。
+  // 三者拼成完整 messages 一次发给 AI，Rust ai_chat / 后端代理均原样转发整个数组。
   const messages = [
     { role: 'system', content: systemPrompt },
+    ...history.map(t => ({ role: t.role, content: t.content })),
     { role: 'user', content: userPrompt }
   ];
 
@@ -313,9 +323,11 @@ export async function translateWithAI(
 }
 
 // 通用 AI 对话函数（用于追问）
+// history：之前的多轮对话（首次 AI 解析 + 已追问的问答），让 AI 能读取上下文连贯作答。
 export async function chatWithAI(
   systemPrompt: string,
-  userMessage: string
+  userMessage: string,
+  history: ChatTurn[] = []
 ): Promise<string> {
   const provider = await getSelectedProvider();
   const apiKey = await getApiKey(provider);
@@ -325,7 +337,7 @@ export async function chatWithAI(
   }
 
   const content = await callAICompletion(
-    provider, apiKey, systemPrompt, userMessage, 0.5, 1000
+    provider, apiKey, systemPrompt, userMessage, 0.5, 1000, history
   );
 
   return content.trim();

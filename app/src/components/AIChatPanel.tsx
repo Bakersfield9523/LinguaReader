@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { chatWithAI } from '@/lib/aiService';
 import { LANGUAGE_NAMES } from '@/types';
 import type { Language } from '@/types';
-import type { AIContextResponse } from '@/lib/aiService';
+import type { AIContextResponse, ChatTurn } from '@/lib/aiService';
 
 interface AIChatPanelProps {
   word: string | null;
@@ -189,10 +189,17 @@ export function AIChatPanel({
       const langNameCn = LANGUAGE_NAMES[language].zh;
       const langNameEn = LANGUAGE_NAMES[language].en;
       const systemPrompt = aiLang === 'zh'
-        ? `你是专业的语言学习助手。用户正在学习${langNameCn}单词"${word}"。上下文："${context}"。请用中文回答用户的问题。`
-        : `You are a professional language tutor. The user is learning the ${langNameEn} word "${word}". Context: "${context}". Please answer in English.`;
+        ? `你是专业的语言学习助手。用户正在学习${langNameCn}单词"${word}"。上下文："${context}"。请用中文回答用户的问题。请结合此前对话历史连贯作答。`
+        : `You are a professional language tutor. The user is learning the ${langNameEn} word "${word}". Context: "${context}". Please answer in English. Continue from the previous conversation history.`;
 
-      const answer = await chatWithAI(systemPrompt, userMsg.content);
+      // 把面板里的历史对话（首次 AI 解析 + 之前的追问问答）作为上下文一起发给 AI。
+      // 必须在追加当前 userMsg 之前读取 messages（此刻闭包里的 messages 尚不含本轮问题），
+      // 过滤掉错误提示气泡，避免把"抱歉，出错了"之类喂给模型。
+      const history: ChatTurn[] = messages
+        .filter(m => m.content && !/^(抱歉|Sorry)/.test(m.content))
+        .map(m => ({ role: m.role, content: m.content }));
+
+      const answer = await chatWithAI(systemPrompt, userMsg.content, history);
 
       const assistantMsg: ChatMessage = {
         id: `ai-${Date.now()}`,
@@ -213,7 +220,7 @@ export function AIChatPanel({
     } finally {
       setIsAsking(false);
     }
-  }, [inputValue, word, hasApiKey, language, context, aiLang]);
+  }, [inputValue, word, hasApiKey, language, context, aiLang, messages]);
 
   // 切换双语并重新请求AI生成完整回复
   const toggleLang = useCallback(() => {
