@@ -297,13 +297,22 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
     const firstEntry = entries[0];
     const wordOut = (firstEntry?.meta?.id || firstEntry?.hw || word).replace(/:\d+$/, '');
 
-    // 音标 / 音频：跨所有义项取第一个有效值（MW 为美式，不区分英/美音）
+    // 音标 / 音频：跨所有义项取第一个有效值（MW 为美式，不区分英/美音）。
+    // ⚠️ MW Learner's API 的音标实际在 e.hwi.prs[].ipa、音频在 e.hwi.prs[].sound.audio；
+    // 旧代码只读 e.prs[].mw（那是 MW Collegiate/另一版 API 的格式）→ 所有英文词音标为空、
+    // 显示成 "—"。这里两种位置都取，hwi.prs 优先，兼容不同数据源。
     let phonetic: string | undefined;
     let audio: string | undefined;
     for (const e of entries) {
-      const prs: any[] = e?.prs || [];
-      for (const p of prs) {
-        if (!phonetic && p?.mw) phonetic = p.mw;
+      const prsList: any[] = [
+        ...(Array.isArray(e?.hwi?.prs) ? e.hwi.prs : []),
+        ...(Array.isArray(e?.prs) ? e.prs : []),
+      ];
+      for (const p of prsList) {
+        if (!phonetic) {
+          const ipa = p?.ipa || p?.mw;
+          if (ipa) phonetic = ipa;
+        }
         const a = p?.sound?.audio;
         if (!audio && a) audio = buildMwAudioUrl(a);
         if (phonetic && audio) break;
