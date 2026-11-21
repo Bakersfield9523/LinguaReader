@@ -22,6 +22,7 @@ import {
 import { EPUBParser, PDFParser, getBookContent, getFileDataAsBlob, stripHtmlToText, countTextUnits } from '@/lib/fileParser';
 import { resolveFontStack, normalizeFontToken } from '@/lib/fonts';
 import { BookDB, HighlightDB } from '@/lib/db';
+import { useReadingTimer } from '@/lib/useReadingTimer';
 import { putContent } from '@/lib/contentCache';
 import { analyzeWordWithAI, hasApiKey as checkHasApiKey, type AIContextResponse } from '@/lib/aiService';
 import { SettingsDialog } from './SettingsDialog';
@@ -404,8 +405,8 @@ export function Reader({
     return () => { isMounted = false; };
   }, [book.id, book.fileData]);
 
-  // 阅读时长记录
-  const readStartTimeRef = useRef<number>(Date.now());
+  // 阅读时长记录（4.4.30：改为"有效活跃时长"，见 useReadingTimer）
+  const markActivity = useReadingTimer(!!book);
 
   // 阅读设置 — 从 localStorage 加载，变更时同步回
   const [settings, setSettings] = useState<ReaderSettings>(() => {
@@ -874,18 +875,7 @@ export function Reader({
     
     return () => {
       isMounted = false;
-      // 保存阅读时长
-      const elapsed = Math.round((Date.now() - readStartTimeRef.current) / 60000);
-      if (elapsed > 0) {
-        // 使用本地日期而非 UTC 日期，避免跨时区记录到错误日期
-        const now = new Date();
-        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-        import('@/lib/db').then(({ ReadingDayDB }) => {
-          ReadingDayDB.addMinutes(today, elapsed);
-        });
-      }
-      // 重置计时器，避免切换书籍时累积时长
-      readStartTimeRef.current = Date.now();
+      // 阅读时长改由 useReadingTimer 按"有效活跃秒数"结算，不再在此按挂钟累加
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book.id, loadBookmarks, loadHighlights, onUpdateProgress]);   // 监听 book.id 变化时重新加载
@@ -1038,6 +1028,7 @@ export function Reader({
   // 滚动位置保存（防抖，500ms）
   // PDF 模式下不处理滚动（PDF 用翻页而非滚动）
   const handleScroll = useCallback(() => {
+    markActivity(); // 有效计时：滚动=正在阅读（iframe 内滚动事件到不了父 window，需显式标记）
     // iframe 渲染模式：滚动发生在 iframe 内部
     if (epubRenderMode === 'iframe' && book.format === 'epub') {
       const f = iframeRef.current;
@@ -1077,7 +1068,7 @@ export function Reader({
       bookProgressRef.current = p;
       onUpdateProgress(book.id, p, currentChapterRef.current, scrollPosRef.current);
     }, 500);
-  }, [book.id, book.format, onUpdateProgress, epubRenderMode]);
+  }, [book.id, book.format, onUpdateProgress, epubRenderMode, markActivity]);
   // 不依赖 currentChapter（用 ref 代替），避免翻页时重建
 
   // 恢复滚动位置（只在 EPUB/TXT 非 iframe 模式下，且只执行一次）
@@ -1319,6 +1310,7 @@ export function Reader({
   // 处理单词点击
   // sentence 参数是从点击位置直接提取的所在句子（精确上下文，避免 indexOf 找到第一次出现的问题）
   const handleWordClick = useCallback(async (word: string, sentence?: string) => {
+    markActivity(); // 有效计时：点词查词=正在阅读
     try {
       // 对于短语（多词），保留原文结构（如 "coup d'état"），只去除首尾标点
       const isPhrase = word.trim().includes(' ');
@@ -1403,7 +1395,7 @@ export function Reader({
       setDictLoading(false);
       setAiLoading(false);
     }
-  }, [book.language, hasAiKey, getWordContext]);
+  }, [book.language, hasAiKey, getWordContext, markActivity]);
 
   // 标记/取消标记单词
   const toggleWordMarker = useCallback(async () => {
@@ -1567,6 +1559,7 @@ export function Reader({
    */
   // 处理 PDF 选中的文字
   const handlePdfTextSelect = useCallback((text: string, sentence?: string, range?: [number, number]) => {
+    markActivity(); // 有效计时：PDF 选词=正在阅读
     const cleanText = text.trim();
     if (cleanText.length === 0) return;
     if (cleanText.length >= 2) {
@@ -1581,7 +1574,7 @@ export function Reader({
       setSidebarMode('selection');
       setShowSidebar(true);
     }
-  }, []);
+  }, [markActivity]);
 
   // 渲染 HTML 内容（直接渲染，保留图片和格式）
   // 内容点击处理器（在 useCallback 中稳定引用）
@@ -1639,6 +1632,7 @@ export function Reader({
 
   // PDF 翻页时同步更新 currentChapter 和保存阅读进度
   const handlePdfPageChange = useCallback((page: number) => {
+    markActivity(); // 有效计时：PDF 翻页=正在阅读
     // 4.4.19：入口钳制到 1..总页数。pdfTotalPages 可能是 0（onPageCount 尚未回调），
     // 此时不能钳到 0，否则会把页码打回 1。
     const max = pdfTotalPages > 0 ? pdfTotalPages : Number.MAX_SAFE_INTEGER;
@@ -1660,7 +1654,7 @@ export function Reader({
     }
     bookProgressRef.current = progress;
     onUpdateProgress(book.id, progress, chapterIdx);
-  }, [book.id, pdfTotalPages, onUpdateProgress]);
+  }, [book.id, pdfTotalPages, onUpdateProgress, markActivity]);
   handlePdfPageChangeRef.current = handlePdfPageChange;
 
   /**
