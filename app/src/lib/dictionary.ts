@@ -233,6 +233,46 @@ function cleanWikiText(t: string): string {
     .trim();
 }
 
+/**
+ * 从 Wiktionary 英語词条解析音标（英式 RP / 美式 GA）。
+ * 只扫描 ==English== 段内的 ===Pronunciation=== 块，避免抓到 fr/de 等其他语言。
+ * 识别格式（见 aura / hello / record / philosophy 实测）：
+ *   {{IPA|en|/ˈɔːɹə/|a=RP}}                           → uk
+ *   {{enPR|rĕkʹôrd|a=RP}}, {{IPA|en|/ˈɹɛk.ɔːd/}}      → uk（标记与 IPA 分在两个相邻模板）
+ *   {{IPA|en|/həˈləʊ/|a=RP}} / {{IPA|en|/hɛˈloʊ/|a=GA}} → uk / us
+ * 音标带多个变体（`/həˈləʊ/|/hɛ-/`）时只取第一个 `/.../`。
+ * 没有显式地区标记时不猜（很多词首个 IPA 是 GA，猜了会把美式当英式），返回 undefined。
+ */
+function parseEnPhonetics(wt: string): { uk?: string; us?: string } {
+  const enMatch = wt.match(/==English==([\s\S]*?)(?=\n==[A-Z][a-z]|$)/);
+  const en = enMatch ? enMatch[1] : '';
+  if (!en) return {};
+  const pron = en.match(/={3,4}\s*Pronunciation\s*={3,4}([\s\S]*?)(?=\n={2,4}[A-Za-z]|$)/i);
+  const block = pron ? pron[1] : en; // 无独立发音小节时退回整段搜（少数词直接把 IPA 写在词源下）
+  const out: { uk?: string; us?: string } = {};
+
+  // 逐行处理：一行里可能有多个模板。地区标记（a=RP/UK/...）可能属于本行的 enPR，
+  // 而 IPA 模板紧随其后——把整行所有 IPA 的 /.../ 取出，按该行出现的地区标记归类。
+  for (const line of block.split('\n')) {
+    if (!/\{\{(IPA\|en|enPR)/i.test(line)) continue;
+    const isUk = /a\s*=\s*(RP|UK|GB|BrE|British)/i.test(line) || /\|\s*RP\b/.test(line);
+    const isUs = /a\s*=\s*(GA|US|AmE|American)/i.test(line);
+    if (!isUk && !isUs) continue;
+    // 收集本行所有 IPA 模板里的第一个 /.../ 音标
+    const ipaTemplates = [...line.matchAll(/\{\{IPA\|en\|([^}]*)\}\}/gi)];
+    const values: string[] = [];
+    for (const t of ipaTemplates) {
+      const first = t[1].match(/\/([^/]+)\//); // 取第一个 /.../，跳过后面的变体
+      if (first && first[1].trim()) values.push(first[1].trim());
+    }
+    if (!values.length) continue;
+    if (isUk && !out.uk) out.uk = values[0];
+    if (isUs && !out.us) out.us = values[0];
+    if (out.uk && out.us) break;
+  }
+  return out;
+}
+
 function parseWiktionary(wt: string): { pos: string | undefined; defs: string[] } | null {
   const m = wt.match(/==English==([\s\S]*?)(?=\n==[A-Z][a-z]|$)/);
   const en = m ? m[1] : '';
@@ -269,9 +309,13 @@ async function getWiktionaryDefinition(word: string): Promise<DictionaryDefiniti
     if (typeof wt !== 'string' || !wt) return null;
     const parsed = parseWiktionary(wt);
     if (!parsed) return null;
+    const ph = parseEnPhonetics(wt);
     return {
       word,
-      phonetic: undefined,
+      // 英式音标取 RP，美式取 GA；phonetic 主字段保留美式（与 MW 一致）。
+      phonetic: ph.us || ph.uk,
+      ukPhonetic: ph.uk,
+      usPhonetic: ph.us,
       partOfSpeech: parsed.pos,
       definitions: parsed.defs,
       examples: [],
@@ -349,7 +393,9 @@ async function getMwDefinition(word: string): Promise<DictionaryDefinition | nul
   return result;
 }
 
-// 一轮查询：MW 与 Wiktionary 并发，MW 成功优先
+// 一轮查询：MW 与 Wiktionary 并发，MW 成功优先。
+// MW 只给美式音标；英式(RP)音标由 Wiktionary 补——两源都并发发起，
+// MW 命中且 Wiktionary 已返回时把 ukPhonetic 合进去，不额外增加串行等待。
 async function queryEnglishOnce(cacheKey: string): Promise<DictionaryDefinition | null> {
   const wtPromise = getWiktionaryDefinition(cacheKey);
   const mwPromise = getMwDefinition(cacheKey);
@@ -365,6 +411,21 @@ async function queryEnglishOnce(cacheKey: string): Promise<DictionaryDefinition 
     } catch {
       result = null;
     }
+  } else {
+    // MW 命中（美式音标/释义质量更好）：若它没有英式音标，从已并发发起的
+    // Wiktionary 结果里补 RP 音标。wtPromise 通常比 mw 还快，await 几乎零等待；
+    // 个别慢的情况用 1.5s 短窗口兜底，超时就放弃补音标、不拖慢查词。
+    try {
+      const wt = await Promise.race([
+        wtPromise,
+        new Promise<null>(r => setTimeout(() => r(null), 1500)),
+      ]);
+      // 注意：MW 命中时 ukPhonetic 目前也是美式音标（4.4.28 两者同为 phonetic），
+      // 故这里是有条件"覆盖"——只要 Wiktionary 给了 RP 就用它替换英式那一路。
+      if (result && wt?.ukPhonetic) {
+        result = { ...result, ukPhonetic: wt.ukPhonetic };
+      }
+    } catch { /* 补音标失败不影响主结果 */ }
   }
   return result;
 }
