@@ -8,20 +8,20 @@ import { useEffect, useRef, useCallback } from 'react';
 //   - 只有「窗口可见 + 最近 ACTIVE_WINDOW_MS 内有用户活动」的一秒才计入。
 //   - 每次用户活动把"接下来 ACTIVE_WINDOW_MS"标记为可计；持续交互则全程计入；
 //     停止活动超过窗口后停止计时（挂机最多虚增 ACTIVE_WINDOW 秒）。
-//   - 阈值取 60s：沉浸阅读时翻页/滚动通常远快于此，不会误伤；挂机 7 小时只会
-//     在开头多记约 1 分钟。
+//   - 阈值取 5 分钟：沉浸阅读/慢读/长时间盯着一段思考都不会误伤；代价是挂机
+//     最多虚增约 5 分钟（相比旧版挂 7 小时记 388 分钟已大幅改善）。
 //   - 不强制要求 document.hasFocus()：实测 Tauri 窗口后台启动/未点击时 hasFocus
 //     可能为 false，强制判断会让正常阅读完全不计时。切走应用后用户不再操作，
-//     60s 活跃窗口耗尽即自动停计，效果等价且更稳。
+//     5 分钟活跃窗口耗尽即自动停计，效果等价且更稳。
 //   - 无法 100% 区分"盯着屏幕静止不动"与"人走开了"，这是所有基于输入的活跃
-//     检测共同的边界；60s 是准确性与误伤率的折中。
+//     检测共同的边界；5 分钟偏宽松，优先保证不误伤正常阅读。
 //
 // 信号：
 //   - 全局 DOM 事件（pointerdown/keydown/wheel/scroll/touchstart）——主文档交互
 //   - visibilitychange —— 切标签、最小化
 //   - 显式 markActivity() —— iframe 内滚动、PDF 选词/翻页等事件到达不了父窗口的场景
 
-const ACTIVE_WINDOW_MS = 60_000;
+const ACTIVE_WINDOW_MS = 5 * 60_000; // 5 分钟：用户要求放宽阈值，优先不误伤慢读/思考
 const TICK_MS = 1_000;
 
 function localDateStr(d: Date): string {
